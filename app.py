@@ -18,6 +18,52 @@ WEED_YOLO_PATH = os.path.join(MODELOS_DIR, "weed_yolo_best.pt")
 
 IMG_SIZE = (224, 224)
 
+# Tradução das classes do PlantVillage (cultura — condição)
+TRADUCAO_CLASSES = {
+    "Apple___Apple_scab": "Macieira — Sarna da macieira",
+    "Apple___Black_rot": "Macieira — Podridão negra",
+    "Apple___Cedar_apple_rust": "Macieira — Ferrugem do cedro",
+    "Apple___healthy": "Macieira — Saudável",
+    "Blueberry___healthy": "Mirtilo — Saudável",
+    "Cherry_(including_sour)___Powdery_mildew": "Cerejeira — Oídio",
+    "Cherry_(including_sour)___healthy": "Cerejeira — Saudável",
+    "Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot": "Milho — Mancha-cinzenta da folha",
+    "Corn_(maize)___Common_rust_": "Milho — Ferrugem comum",
+    "Corn_(maize)___Northern_Leaf_Blight": "Milho — Helmintosporiose do norte",
+    "Corn_(maize)___healthy": "Milho — Saudável",
+    "Grape___Black_rot": "Videira — Podridão negra",
+    "Grape___Esca_(Black_Measles)": "Videira — Esca (sarampo negro)",
+    "Grape___Leaf_blight_(Isariopsis_Leaf_Spot)": "Videira — Mancha das folhas (Isariopsis)",
+    "Grape___healthy": "Videira — Saudável",
+    "Orange___Haunglongbing_(Citrus_greening)": "Laranjeira — Greening dos citrinos",
+    "Peach___Bacterial_spot": "Pessegueiro — Mancha bacteriana",
+    "Peach___healthy": "Pessegueiro — Saudável",
+    "Pepper,_bell___Bacterial_spot": "Pimento — Mancha bacteriana",
+    "Pepper,_bell___healthy": "Pimento — Saudável",
+    "Potato___Early_blight": "Batateira — Pinta-preta",
+    "Potato___Late_blight": "Batateira — Requeima",
+    "Potato___healthy": "Batateira — Saudável",
+    "Raspberry___healthy": "Framboesa — Saudável",
+    "Soybean___healthy": "Soja — Saudável",
+    "Squash___Powdery_mildew": "Abóbora — Oídio",
+    "Strawberry___Leaf_scorch": "Morangueiro — Queima das folhas",
+    "Strawberry___healthy": "Morangueiro — Saudável",
+    "Tomato___Bacterial_spot": "Tomateiro — Mancha bacteriana",
+    "Tomato___Early_blight": "Tomateiro — Pinta-preta",
+    "Tomato___Late_blight": "Tomateiro — Requeima",
+    "Tomato___Leaf_Mold": "Tomateiro — Bolor das folhas",
+    "Tomato___Septoria_leaf_spot": "Tomateiro — Septoriose",
+    "Tomato___Spider_mites Two-spotted_spider_mite": "Tomateiro — Ácaro-rajado",
+    "Tomato___Target_Spot": "Tomateiro — Mancha-alvo",
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus": "Tomateiro — Vírus do enrolamento amarelo da folha",
+    "Tomato___Tomato_mosaic_virus": "Tomateiro — Vírus do mosaico",
+    "Tomato___healthy": "Tomateiro — Saudável",
+}
+
+
+def traduzir_classe(nome_classe):
+    return TRADUCAO_CLASSES.get(nome_classe, nome_classe.replace("___", " — ").replace("_", " "))
+
 
 # ---------- Carregamento de modelos (cache para não recarregar a cada interação) ----------
 
@@ -114,13 +160,13 @@ if uploaded_file is not None:
         with col2:
             st.subheader("Resultado")
             classe_top, conf_top = resultados[0]
-            nome_legivel = classe_top.replace("___", " — ").replace("_", " ")
+            nome_legivel = traduzir_classe(classe_top)
             st.success(f"**{nome_legivel}**")
             st.metric("Confiança", f"{conf_top * 100:.1f}%")
 
             st.write("Outras possibilidades:")
             for classe, conf in resultados[1:]:
-                nome = classe.replace("___", " — ").replace("_", " ")
+                nome = traduzir_classe(classe)
                 st.write(f"- {nome}: {conf * 100:.1f}%")
 
         st.caption("⚠️ Modelo EfficientNetB0 treinado no dataset PlantVillage (38 classes, 99% accuracy em teste). Use como apoio à decisão, não como diagnóstico definitivo.")
