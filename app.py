@@ -105,7 +105,7 @@ if uploaded_file is not None:
 
     with col1:
         st.subheader("Imagem original")
-        st.image(imagem, use_container_width=True)
+        st.image(imagem, use_column_width=True)
 
     if opcao.startswith("🍃"):
         with st.spinner("A classificar a doença..."):
@@ -133,7 +133,7 @@ if uploaded_file is not None:
         with col2:
             st.subheader("Resultado")
             st.metric("Maçãs detetadas", n_frutos)
-            st.image(img_anotada, use_container_width=True)
+            st.image(img_anotada, use_column_width=True)
 
         st.caption("⚠️ Modelo YOLOv8n treinado no dataset MinneApple (mAP50: 0.865). Erro de contagem agregado medido em validação: 0.39% com conf=0.35.")
 
@@ -147,7 +147,7 @@ if uploaded_file is not None:
             c1, c2 = st.columns(2)
             c1.metric("🌾 Cultura (crop)", n_crop)
             c2.metric("🌿 Erva daninha (weed)", n_weed)
-            st.image(img_anotada, use_container_width=True)
+            st.image(img_anotada, use_column_width=True)
 
         st.caption("⚠️ Modelo YOLOv8n treinado em dataset de sésamo + ervas daninhas (mAP50: 0.826).")
 
