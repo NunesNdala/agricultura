@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 import json
 import os
-import cv2
+
 
 st.set_page_config(
     page_title="Agricultura Inteligente",
@@ -136,6 +136,7 @@ def _iou(a, b):
 
 
 def contar_frutos_owlv2(imagem_pil, threshold=0.28, tile_size=500, overlap=0.35):
+    import cv2
     detector = carregar_owlv2()
     img_np = np.array(imagem_pil)
     H, W = img_np.shape[:2]
