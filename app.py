@@ -3,6 +3,7 @@ import numpy as np
 from PIL import Image
 import json
 import os
+import cv2
 
 st.set_page_config(
     page_title="Agricultura Inteligente",
@@ -18,7 +19,6 @@ WEED_YOLO_PATH = os.path.join(MODELOS_DIR, "weed_yolo_best.pt")
 
 IMG_SIZE = (224, 224)
 
-# Tradução das classes do PlantVillage (cultura — condição)
 TRADUCAO_CLASSES = {
     "Apple___Apple_scab": "Macieira — Sarna da macieira",
     "Apple___Black_rot": "Macieira — Podridão negra",
@@ -65,7 +65,7 @@ def traduzir_classe(nome_classe):
     return TRADUCAO_CLASSES.get(nome_classe, nome_classe.replace("___", " — ").replace("_", " "))
 
 
-# ---------- Carregamento de modelos (cache para não recarregar a cada interação) ----------
+# ---------- Carregamento de modelos ----------
 
 @st.cache_resource
 def carregar_modelo_doencas():
@@ -88,49 +88,128 @@ def carregar_modelo_ervas():
     return YOLO(WEED_YOLO_PATH)
 
 
+@st.cache_resource
+def carregar_owlv2():
+    from transformers import pipeline
+    import torch
+    detector = pipeline(
+        model="google/owlv2-base-patch16-ensemble",
+        task="zero-shot-object-detection",
+        device=0 if torch.cuda.is_available() else -1,
+    )
+    return detector
+
+
 # ---------- Funções de inferência ----------
 
 def prever_doenca(imagem_pil):
     import tensorflow as tf
     modelo, classes = carregar_modelo_doencas()
-
     img_resized = imagem_pil.resize(IMG_SIZE)
     img_array = np.array(img_resized)
-    if img_array.shape[-1] == 4:  # remover canal alpha, se existir
+    if img_array.shape[-1] == 4:
         img_array = img_array[..., :3]
     img_array = np.expand_dims(img_array, axis=0)
-
     preds = modelo.predict(img_array, verbose=0)[0]
-    idx_top = np.argsort(preds)[::-1][:3]  # top-3
-
-    resultados = [(classes[i], float(preds[i])) for i in idx_top]
-    return resultados
+    idx_top = np.argsort(preds)[::-1][:3]
+    return [(classes[i], float(preds[i])) for i in idx_top]
 
 
-def contar_frutos(imagem_pil, conf=0.35):
+def contar_frutos_yolo(imagem_pil, conf=0.35):
     modelo = carregar_modelo_frutos()
     resultado = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=960, verbose=False)[0]
     n_frutos = len(resultado.boxes)
-    img_anotada = resultado.plot()  # BGR
-    img_anotada_rgb = img_anotada[:, :, ::-1]  # BGR -> RGB
-    return n_frutos, img_anotada_rgb
+    img_anotada = resultado.plot()[:, :, ::-1]
+    return n_frutos, img_anotada
+
+
+def _iou(a, b):
+    ax1, ay1, ax2, ay2 = a['box']['xmin'], a['box']['ymin'], a['box']['xmax'], a['box']['ymax']
+    bx1, by1, bx2, by2 = b['box']['xmin'], b['box']['ymin'], b['box']['xmax'], b['box']['ymax']
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0
+
+
+def contar_frutos_owlv2(imagem_pil, threshold=0.28, tile_size=500, overlap=0.35):
+    detector = carregar_owlv2()
+    img_np = np.array(imagem_pil)
+    H, W = img_np.shape[:2]
+    queries = ["apple", "red apple", "apple on ground"]
+
+    step = int(tile_size * (1 - overlap))
+    ys = list(range(0, max(1, H - tile_size + 1), step))
+    xs = list(range(0, max(1, W - tile_size + 1), step))
+    if not ys or ys[-1] + tile_size < H:
+        ys.append(max(0, H - tile_size))
+    if not xs or xs[-1] + tile_size < W:
+        xs.append(max(0, W - tile_size))
+
+    todas = []
+    total_tiles = len(ys) * len(xs)
+    prog = st.progress(0, text="A analisar imagem em janelas...")
+
+    for ti, y0 in enumerate(ys):
+        for tj, x0 in enumerate(xs):
+            y1_t = min(y0 + tile_size, H)
+            x1_t = min(x0 + tile_size, W)
+            tile = imagem_pil.crop((x0, y0, x1_t, y1_t))
+            res = detector(tile, candidate_labels=queries)
+            for r in res:
+                if r['score'] < threshold:
+                    continue
+                box = r['box']
+                todas.append({
+                    'score': r['score'],
+                    'label': r['label'],
+                    'box': {
+                        'xmin': box['xmin'] + x0,
+                        'ymin': box['ymin'] + y0,
+                        'xmax': box['xmax'] + x0,
+                        'ymax': box['ymax'] + y0,
+                    }
+                })
+        prog.progress(min((ti + 1) / len(ys), 1.0),
+                      text=f"A processar... {(ti+1)*len(xs)}/{total_tiles} tiles")
+
+    prog.empty()
+
+    # NMS global
+    sorted_det = sorted(todas, key=lambda x: -x['score'])
+    kept = []
+    for r in sorted_det:
+        if all(_iou(r, k) < 0.35 for k in kept):
+            kept.append(r)
+
+    # Desenhar caixas
+    img_det = img_np.copy()
+    for r in kept:
+        box = r['box']
+        x1, y1, x2, y2 = int(box['xmin']), int(box['ymin']), int(box['xmax']), int(box['ymax'])
+        cv2.rectangle(img_det, (x1, y1), (x2, y2), (0, 200, 0), 2)
+        cv2.putText(img_det, f"{r['score']:.2f}", (x1, max(y1 - 4, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
+
+    return len(kept), img_det
 
 
 def detetar_ervas(imagem_pil, conf=0.4):
     modelo = carregar_modelo_ervas()
     resultado = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=640, verbose=False)[0]
-    img_anotada = resultado.plot()
-    img_anotada_rgb = img_anotada[:, :, ::-1]
-
+    img_anotada = resultado.plot()[:, :, ::-1]
     n_crop = sum(1 for c in resultado.boxes.cls if int(c) == 0)
     n_weed = sum(1 for c in resultado.boxes.cls if int(c) == 1)
-    return n_crop, n_weed, img_anotada_rgb
+    return n_crop, n_weed, img_anotada
 
 
 # ---------- Interface ----------
 
 st.title("🌱 Visão Computacional Aplicada à Agricultura Inteligente")
-st.caption("Sistema de apoio à decisão com 3 modelos de Deep Learning treinados para deteção de doenças, contagem de frutos e deteção de ervas daninhas.")
+st.caption("Sistema de apoio à decisão com modelos de Deep Learning para deteção de doenças, contagem de frutos e deteção de ervas daninhas.")
 
 st.sidebar.header("Escolha o modelo")
 opcao = st.sidebar.radio(
@@ -141,6 +220,26 @@ opcao = st.sidebar.radio(
         "🌿 Deteção de Ervas Daninhas",
     ]
 )
+
+# Opções extra para contagem de frutos
+if opcao.startswith("🍎"):
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Pipeline de deteção")
+    pipeline_frutos = st.sidebar.radio(
+        "Método:",
+        ["YOLOv8 (rápido)", "OWLv2 Sliding Window (avançado)"],
+        help="YOLOv8: treinado no MinneApple, rápido mas limitado a maçãs na árvore.\n\nOWLv2: zero-shot, deteta maçãs no chão e em oclusão, mais lento."
+    )
+
+    if pipeline_frutos == "YOLOv8 (rápido)":
+        conf_threshold = st.sidebar.slider("Confiança mínima (conf)", 0.1, 0.9, 0.35, 0.05)
+    else:
+        owl_threshold = st.sidebar.slider("Threshold OWLv2", 0.10, 0.50, 0.28, 0.01)
+        tile_size = st.sidebar.select_slider("Tamanho do tile (px)", [300, 400, 500, 640], value=500)
+        st.sidebar.caption("⚠️ O modo avançado pode demorar 2–4 minutos dependendo do tamanho da imagem.")
+
+elif opcao.startswith("🌿"):
+    conf_threshold = st.sidebar.slider("Confiança mínima (conf)", 0.1, 0.9, 0.4, 0.05)
 
 uploaded_file = st.file_uploader("Carregar imagem", type=["jpg", "jpeg", "png"])
 
@@ -153,6 +252,7 @@ if uploaded_file is not None:
         st.subheader("Imagem original")
         st.image(imagem, use_column_width=True)
 
+    # ---- Doenças ----
     if opcao.startswith("🍃"):
         with st.spinner("A classificar a doença..."):
             resultados = prever_doenca(imagem)
@@ -163,28 +263,66 @@ if uploaded_file is not None:
             nome_legivel = traduzir_classe(classe_top)
             st.success(f"**{nome_legivel}**")
             st.metric("Confiança", f"{conf_top * 100:.1f}%")
-
             st.write("Outras possibilidades:")
             for classe, conf in resultados[1:]:
-                nome = traduzir_classe(classe)
-                st.write(f"- {nome}: {conf * 100:.1f}%")
+                st.write(f"- {traduzir_classe(classe)}: {conf * 100:.1f}%")
 
-        st.caption("⚠️ Modelo EfficientNetB0 treinado no dataset PlantVillage (38 classes, 99% accuracy em teste). Use como apoio à decisão, não como diagnóstico definitivo.")
+        st.caption("⚠️ Modelo EfficientNetB0 treinado no dataset PlantVillage (38 classes, 99% accuracy em teste).")
 
+    # ---- Contagem de frutos ----
     elif opcao.startswith("🍎"):
-        conf_threshold = st.sidebar.slider("Confiança mínima (conf)", 0.1, 0.9, 0.35, 0.05)
-        with st.spinner("A contar maçãs..."):
-            n_frutos, img_anotada = contar_frutos(imagem, conf=conf_threshold)
 
-        with col2:
-            st.subheader("Resultado")
-            st.metric("Maçãs detetadas", n_frutos)
-            st.image(img_anotada, use_column_width=True)
+        if pipeline_frutos == "YOLOv8 (rápido)":
+            with st.spinner("A contar maçãs com YOLOv8..."):
+                n_frutos, img_anotada = contar_frutos_yolo(imagem, conf=conf_threshold)
 
-        st.caption("⚠️ Modelo YOLOv8n treinado no dataset MinneApple (mAP50: 0.865). Erro de contagem agregado medido em validação: 0.39% com conf=0.35.")
+            with col2:
+                st.subheader("Resultado — YOLOv8")
+                st.metric("🍎 Maçãs detetadas", n_frutos)
+                st.image(img_anotada, use_column_width=True)
 
+            st.caption(
+                "⚠️ YOLOv8n treinado no MinneApple (mAP50: 0.865, erro agregado: 0.39% em validação). "
+                "Limitado a maçãs na árvore — para maçãs no chão use o modo OWLv2."
+            )
+
+        else:
+            st.info("🔍 Modo avançado: a imagem será processada em tiles sobrepostos com OWLv2 (zero-shot). Aguarde...")
+
+            with st.spinner("A processar com OWLv2 Sliding Window..."):
+                n_frutos, img_anotada = contar_frutos_owlv2(
+                    imagem,
+                    threshold=owl_threshold,
+                    tile_size=tile_size,
+                    overlap=0.35
+                )
+
+            with col2:
+                st.subheader("Resultado — OWLv2 (zero-shot)")
+                st.metric("🍎 Maçãs detetadas", n_frutos)
+                st.image(img_anotada, use_column_width=True)
+
+            # Comparação com YOLO
+            with st.expander("📊 Comparar com YOLOv8 (mesma imagem)"):
+                with st.spinner("A correr YOLOv8 para comparação..."):
+                    n_yolo, img_yolo = contar_frutos_yolo(imagem, conf=0.35)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric("YOLOv8", n_yolo, help="Treinado no MinneApple")
+                    st.image(img_yolo, use_column_width=True)
+                with c2:
+                    st.metric("OWLv2 Sliding Window", n_frutos,
+                              delta=n_frutos - n_yolo,
+                              help="Zero-shot, sem treino específico")
+                    st.image(img_anotada, use_column_width=True)
+
+            st.caption(
+                "⚠️ OWLv2 (google/owlv2-base-patch16-ensemble) — modelo zero-shot de visão-linguagem. "
+                f"Threshold: {owl_threshold} | Tile: {tile_size}px | Overlap: 35%."
+            )
+
+    # ---- Ervas daninhas ----
     else:
-        conf_threshold = st.sidebar.slider("Confiança mínima (conf)", 0.1, 0.9, 0.4, 0.05)
         with st.spinner("A detetar plantas..."):
             n_crop, n_weed, img_anotada = detetar_ervas(imagem, conf=conf_threshold)
 
