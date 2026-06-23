@@ -136,7 +136,6 @@ def _iou(a, b):
 
 
 def contar_frutos_owlv2(imagem_pil, threshold=0.28, tile_size=500, overlap=0.35):
-    import cv2
     detector = carregar_owlv2()
     img_np = np.array(imagem_pil)
     H, W = img_np.shape[:2]
@@ -186,16 +185,17 @@ def contar_frutos_owlv2(imagem_pil, threshold=0.28, tile_size=500, overlap=0.35)
         if all(_iou(r, k) < 0.35 for k in kept):
             kept.append(r)
 
-    # Desenhar caixas
-    img_det = img_np.copy()
+    # Desenhar caixas com PIL (sem cv2)
+    from PIL import ImageDraw
+    img_pil_out = Image.fromarray(img_np.copy())
+    draw = ImageDraw.Draw(img_pil_out)
     for r in kept:
         box = r['box']
         x1, y1, x2, y2 = int(box['xmin']), int(box['ymin']), int(box['xmax']), int(box['ymax'])
-        cv2.rectangle(img_det, (x1, y1), (x2, y2), (0, 200, 0), 2)
-        cv2.putText(img_det, f"{r['score']:.2f}", (x1, max(y1 - 4, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
+        draw.rectangle([x1, y1, x2, y2], outline=(0, 200, 0), width=2)
+        draw.text((x1, max(y1 - 12, 0)), f"{r['score']:.2f}", fill=(0, 200, 0))
 
-    return len(kept), img_det
+    return len(kept), np.array(img_pil_out)
 
 
 def detetar_ervas(imagem_pil, conf=0.4):
