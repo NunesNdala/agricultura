@@ -303,19 +303,22 @@ if uploaded_file is not None:
                 st.metric("🍎 Maçãs detetadas", n_frutos)
                 st.image(img_anotada, use_column_width=True)
 
-            # Comparação com YOLO
+            # Comparação com YOLO — só corre se o utilizador clicar
             with st.expander("📊 Comparar com YOLOv8 (mesma imagem)"):
-                with st.spinner("A correr YOLOv8 para comparação..."):
-                    n_yolo, img_yolo = contar_frutos_yolo(imagem, conf=0.35)
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.metric("YOLOv8", n_yolo, help="Treinado no MinneApple")
-                    st.image(img_yolo, use_column_width=True)
-                with c2:
-                    st.metric("OWLv2 Sliding Window", n_frutos,
-                              delta=n_frutos - n_yolo,
-                              help="Zero-shot, sem treino específico")
-                    st.image(img_anotada, use_column_width=True)
+                if st.button("▶ Correr comparação YOLOv8 vs OWLv2"):
+                    with st.spinner("A correr YOLOv8 para comparação..."):
+                        n_yolo, img_yolo = contar_frutos_yolo(imagem, conf=0.35)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.metric("YOLOv8", n_yolo, help="Treinado no MinneApple")
+                        st.image(img_yolo, use_column_width=True)
+                    with c2:
+                        st.metric("OWLv2 Sliding Window", n_frutos,
+                                  delta=n_frutos - n_yolo,
+                                  help="Zero-shot, sem treino específico")
+                        st.image(img_anotada, use_column_width=True)
+                else:
+                    st.caption("Clique no botão acima para correr o YOLOv8 e comparar lado a lado.")
 
             st.caption(
                 "⚠️ OWLv2 (google/owlv2-base-patch16-ensemble) — modelo zero-shot de visão-linguagem. "
