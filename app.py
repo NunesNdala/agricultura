@@ -16,7 +16,6 @@ EFFICIENTNET_PATH = os.path.join(MODELOS_DIR, "plantvillage_efficientnet_final.k
 CLASS_NAMES_PATH = os.path.join(MODELOS_DIR, "class_names.json")
 MINNEAPPLE_YOLO_PATH = os.path.join(MODELOS_DIR, "minneapple_yolo_best.pt")
 WEED_YOLO_PATH = os.path.join(MODELOS_DIR, "weed_yolo_best.pt")
-FRUITS_VEG_YOLO_PATH = os.path.join(MODELOS_DIR, "fruits_vegetables_yolo_v3.pt")
 
 IMG_SIZE = (224, 224)
 
@@ -66,78 +65,6 @@ def traduzir_classe(nome_classe):
     return TRADUCAO_CLASSES.get(nome_classe, nome_classe.replace("___", " — ").replace("_", " "))
 
 
-# Classes do modelo YOLO de frutas/vegetais (treinado no LVIS_Mirror, 63 classes)
-TRADUCAO_FRUTAS_VEGETAIS = {
-    "almond": "Amêndoa",
-    "apple": "Maçã",
-    "apricot": "Damasco",
-    "artichoke": "Alcachofra",
-    "asparagus": "Espargo",
-    "avocado": "Avocado",
-    "banana": "Banana",
-    "bean curd/tofu": "Tofu",
-    "bell pepper/capsicum": "Pimento",
-    "blackberry": "Amora",
-    "blueberry": "Mirtilo",
-    "broccoli": "Brócolos",
-    "brussels sprouts": "Couve-de-bruxelas",
-    "cantaloup/cantaloupe": "Melão cantalupo",
-    "carrot": "Cenoura",
-    "cauliflower": "Couve-flor",
-    "cayenne/cayenne spice/cayenne pepper/cayenne pepper spice/red pepper/red pepper": "Piri-piri (cayenne)",
-    "celery": "Aipo",
-    "cherry": "Cereja",
-    "chickpea/garbanzo": "Grão-de-bico",
-    "chili/chili vegetable/chili pepper/chili pepper vegetable/chilli/chilli vegetable/chilly/chilly": "Malagueta",
-    "clementine": "Clementina",
-    "coconut/cocoanut": "Coco",
-    "edible corn/corn/maize": "Milho",
-    "cucumber/cuke": "Pepino",
-    "date/date fruit": "Tâmara",
-    "eggplant/aubergine": "Beringela",
-    "fig/fig fruit": "Figo",
-    "garlic/ail": "Alho",
-    "ginger/gingerroot": "Gengibre",
-    "Strawberry": "Morango",
-    "gourd": "Cabaça",
-    "grape": "Uva",
-    "green bean": "Feijão-verde",
-    "green onion/spring onion/scallion": "Cebolinho",
-    "Tomato": "Tomate",
-    "kiwi fruit": "Kiwi",
-    "lemon": "Limão",
-    "lettuce": "Alface",
-    "lime": "Lima",
-    "mandarin orange": "Tangerina",
-    "melon": "Melão",
-    "mushroom": "Cogumelo",
-    "onion": "Cebola",
-    "orange/orange fruit": "Laranja",
-    "papaya": "Papaia",
-    "pea/pea food": "Ervilha",
-    "peach": "Pêssego",
-    "pear": "Pera",
-    "persimmon": "Dióspiro",
-    "pickle": "Picles",
-    "pineapple": "Ananás",
-    "potato": "Batata",
-    "prune": "Ameixa seca",
-    "pumpkin": "Abóbora",
-    "radish/daikon": "Rabanete",
-    "raspberry": "Framboesa",
-    "strawberry": "Morango",
-    "sweet potato": "Batata-doce",
-    "tomato": "Tomate",
-    "turnip": "Nabo",
-    "watermelon": "Melancia",
-    "zucchini/courgette": "Curgete",
-}
-
-
-def traduzir_fruta_vegetal(nome_classe):
-    return TRADUCAO_FRUTAS_VEGETAIS.get(nome_classe, nome_classe)
-
-
 # ---------- Carregamento de modelos ----------
 
 @st.cache_resource
@@ -162,12 +89,6 @@ def carregar_modelo_ervas():
 
 
 @st.cache_resource
-def carregar_modelo_frutas_vegetais():
-    from ultralytics import YOLO
-    return YOLO(FRUITS_VEG_YOLO_PATH)
-
-
-@st.cache_resource
 def carregar_owlv2():
     from transformers import pipeline
     import torch
@@ -183,18 +104,50 @@ def carregar_owlv2():
 
 def calibrar_threshold_automatico(todas_detecoes, min_t=0.20, max_t=0.70):
     """
-    Escolhe automaticamente o threshold baseado no percentil 70 dos scores.
-    Garante que só os 30% scores mais altos passam, adaptando-se
-    automaticamente à densidade de objetos na imagem.
-    Aplica também um mínimo de 0.35 para evitar falsos positivos.
+    Escolhe automaticamente o threshold aplicando o método de Otsu ao
+    histograma dos scores de deteção.
+
+    Otsu encontra o limiar que separa as deteções em duas classes
+    (provável fundo/falso positivo vs. provável maçã) minimizando a
+    variância intra-classe (ou, de forma equivalente, maximizando a
+    variância entre classes). Isto adapta-se à distribuição real dos
+    scores de cada imagem, em vez de usar um corte fixo.
+
+    Aplica-se ainda um mínimo de 0.35 e um máximo de max_t para evitar
+    thresholds degenerados quando a distribuição de scores é pouco
+    informativa (ex.: poucas deteções, ou todos os scores muito
+    próximos entre si).
     """
     if len(todas_detecoes) < 5:
         return 0.45
 
-    scores = np.array([r['score'] for r in todas_detecoes])
-    threshold_percentil = float(np.percentile(scores, 70))
+    scores = np.array([r['score'] for r in todas_detecoes], dtype=np.float64)
+
+    # Otsu precisa de um histograma — discretizar os scores em 256 bins
+    # no intervalo [0, 1], tal como se faria com intensidades de pixel.
+    hist, bin_edges = np.histogram(scores, bins=256, range=(0.0, 1.0))
+    hist = hist.astype(np.float64)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    if hist.sum() == 0:
+        return 0.45
+
+    prob = hist / hist.sum()
+    omega = np.cumsum(prob)                      # peso acumulado da classe "baixa"
+    mu = np.cumsum(prob * bin_centers)            # média acumulada
+    mu_total = mu[-1]
+
+    # Variância entre classes para cada limiar candidato k
+    with np.errstate(divide='ignore', invalid='ignore'):
+        numerador = (mu_total * omega - mu) ** 2
+        denominador = omega * (1.0 - omega)
+        variancia_entre_classes = np.where(denominador > 0, numerador / denominador, 0.0)
+
+    k_otimo = int(np.argmax(variancia_entre_classes))
+    threshold_otsu = float(bin_centers[k_otimo])
+
     # Garantir mínimo de 0.35 e máximo de max_t
-    threshold_final = max(min(threshold_percentil, max_t), max(min_t, 0.35))
+    threshold_final = max(min(threshold_otsu, max_t), max(min_t, 0.35))
     return round(threshold_final, 2)
 
 
@@ -310,23 +263,6 @@ def detetar_ervas(imagem_pil, conf=0.4):
     return n_crop, n_weed, img_anotada
 
 
-def detetar_frutas_vegetais(imagem_pil, conf=0.35):
-    modelo = carregar_modelo_frutas_vegetais()
-    resultado = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=640, verbose=False)[0]
-    img_anotada = resultado.plot()[:, :, ::-1]
-
-    nomes_modelo = resultado.names
-    contagem = {}
-    for c in resultado.boxes.cls:
-        nome_en = nomes_modelo[int(c)]
-        nome_pt = traduzir_fruta_vegetal(nome_en)
-        contagem[nome_pt] = contagem.get(nome_pt, 0) + 1
-
-    n_total = len(resultado.boxes)
-    contagem_ordenada = dict(sorted(contagem.items(), key=lambda x: -x[1]))
-    return n_total, contagem_ordenada, img_anotada
-
-
 # ---------- Interface ----------
 
 st.title("🌱 Visão Computacional Aplicada à Agricultura Inteligente")
@@ -339,7 +275,6 @@ opcao = st.sidebar.radio(
         "🍃 Classificação de Doenças (Folhas)",
         "🍎 Contagem de Frutos (Maçãs)",
         "🌿 Deteção de Ervas Daninhas",
-        "🥦 Deteção de Frutas e Vegetais",
     ]
 )
 
@@ -360,9 +295,6 @@ if opcao.startswith("🍎"):
 elif opcao.startswith("🌿"):
     conf_threshold = st.sidebar.slider("Confiança mínima (conf)", 0.1, 0.9, 0.4, 0.05)
 
-elif opcao.startswith("🥦"):
-    conf_threshold = st.sidebar.slider("Confiança mínima (conf)", 0.1, 0.9, 0.35, 0.05)
-
 uploaded_file = st.file_uploader("Carregar imagem", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
@@ -372,7 +304,7 @@ if uploaded_file is not None:
 
     with col1:
         st.subheader("Imagem original")
-        st.image(imagem, use_column_width=True)
+        st.image(imagem, use_container_width=True)
 
     if opcao.startswith("🍃"):
         with st.spinner("A classificar a doença..."):
@@ -394,7 +326,7 @@ if uploaded_file is not None:
             with col2:
                 st.subheader("Resultado — YOLOv8")
                 st.metric("🍎 Maçãs detetadas", n_frutos)
-                st.image(img_anotada, use_column_width=True)
+                st.image(img_anotada, use_container_width=True)
             st.caption("⚠️ YOLOv8n treinado no MinneApple (mAP50: 0.865, erro agregado: 0.39%). Limitado a maçãs na árvore.")
 
         else:
@@ -405,7 +337,7 @@ if uploaded_file is not None:
             with col2:
                 st.subheader("Resultado — OWLv2 (zero-shot)")
                 st.metric("🍎 Maçãs detetadas", n_frutos)
-                st.image(img_anotada, use_column_width=True)
+                st.image(img_anotada, use_container_width=True)
 
             st.sidebar.success(f"🎯 Threshold calibrado automaticamente: **{threshold_auto}**")
 
@@ -416,16 +348,16 @@ if uploaded_file is not None:
                     c1, c2 = st.columns(2)
                     with c1:
                         st.metric("YOLOv8", n_yolo)
-                        st.image(img_yolo, use_column_width=True)
+                        st.image(img_yolo, use_container_width=True)
                     with c2:
                         st.metric("OWLv2 Sliding Window", n_frutos, delta=n_frutos - n_yolo)
-                        st.image(img_anotada, use_column_width=True)
+                        st.image(img_anotada, use_container_width=True)
                 else:
                     st.caption("Clique no botão acima para correr o YOLOv8 e comparar lado a lado.")
 
             st.caption(f"⚠️ OWLv2 (google/owlv2-base-patch16-ensemble) — zero-shot com calibração Otsu automática. Threshold: {threshold_auto} | Tile: {tile_size}px | Overlap: 35%.")
 
-    elif opcao.startswith("🌿"):
+    else:
         with st.spinner("A detetar plantas..."):
             n_crop, n_weed, img_anotada = detetar_ervas(imagem, conf=conf_threshold)
         with col2:
@@ -433,23 +365,8 @@ if uploaded_file is not None:
             c1, c2 = st.columns(2)
             c1.metric("🌾 Cultura (crop)", n_crop)
             c2.metric("🌿 Erva daninha (weed)", n_weed)
-            st.image(img_anotada, use_column_width=True)
+            st.image(img_anotada, use_container_width=True)
         st.caption("⚠️ Modelo YOLOv8n treinado em dataset de sésamo + ervas daninhas (mAP50: 0.826).")
-
-    else:
-        with st.spinner("A detetar frutas e vegetais..."):
-            n_total, contagem, img_anotada = detetar_frutas_vegetais(imagem, conf=conf_threshold)
-        with col2:
-            st.subheader("Resultado")
-            st.metric("🥦 Itens detetados", n_total)
-            st.image(img_anotada, use_column_width=True)
-            if contagem:
-                st.write("Detalhe por item:")
-                for nome_pt, qtd in contagem.items():
-                    st.write(f"- {nome_pt}: {qtd}")
-            else:
-                st.info("Nenhum item detetado com o threshold atual. Tenta reduzir a confiança mínima na barra lateral.")
-        st.caption("⚠️ Modelo YOLOv8 treinado no subconjunto LVIS_Mirror (63 classes de frutas/vegetais, mAP50: 0.247).")
 
 else:
     st.info("Carregue uma imagem para começar.")
