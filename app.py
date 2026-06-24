@@ -4,7 +4,6 @@ from PIL import Image
 import json
 import os
 
-
 st.set_page_config(
     page_title="Agricultura Inteligente",
     page_icon="🌱",
@@ -13,9 +12,10 @@ st.set_page_config(
 
 MODELOS_DIR = "modelos"
 EFFICIENTNET_PATH = os.path.join(MODELOS_DIR, "plantvillage_efficientnet_final.keras")
-CLASS_NAMES_PATH = os.path.join(MODELOS_DIR, "class_names.json")
-MINNEAPPLE_YOLO_PATH = os.path.join(MODELOS_DIR, "minneapple_yolo_best.pt")
-WEED_YOLO_PATH = os.path.join(MODELOS_DIR, "weed_yolo_best.pt")
+CLASS_NAMES_PATH  = os.path.join(MODELOS_DIR, "class_names.json")
+MINNEAPPLE_PATH   = os.path.join(MODELOS_DIR, "minneapple_yolo_best.pt")
+FRUITS_VEG_PATH   = os.path.join(MODELOS_DIR, "yolo_fruits_and_vegetables_v3.pt")
+WEED_PATH         = os.path.join(MODELOS_DIR, "weed_yolo_best.pt")
 
 IMG_SIZE = (224, 224)
 
@@ -60,12 +60,8 @@ TRADUCAO_CLASSES = {
     "Tomato___healthy": "Tomateiro — Saudável",
 }
 
-
 def traduzir_classe(nome_classe):
     return TRADUCAO_CLASSES.get(nome_classe, nome_classe.replace("___", " — ").replace("_", " "))
-
-
-# ---------- Carregamento de modelos ----------
 
 @st.cache_resource
 def carregar_modelo_doencas():
@@ -75,193 +71,124 @@ def carregar_modelo_doencas():
         classes = json.load(f)
     return modelo, classes
 
+@st.cache_resource
+def carregar_minneapple():
+    from ultralytics import YOLO
+    return YOLO(MINNEAPPLE_PATH)
 
 @st.cache_resource
-def carregar_modelo_frutos():
+def carregar_fruits_veg():
     from ultralytics import YOLO
-    return YOLO(MINNEAPPLE_YOLO_PATH)
-
+    return YOLO(FRUITS_VEG_PATH)
 
 @st.cache_resource
 def carregar_modelo_ervas():
     from ultralytics import YOLO
-    return YOLO(WEED_YOLO_PATH)
-
+    return YOLO(WEED_PATH)
 
 @st.cache_resource
 def carregar_owlv2():
     from transformers import pipeline
     import torch
-    detector = pipeline(
+    return pipeline(
         model="google/owlv2-base-patch16-ensemble",
         task="zero-shot-object-detection",
         device=0 if torch.cuda.is_available() else -1,
     )
-    return detector
-
-
-# ---------- Calibração automática de threshold (método Otsu) ----------
 
 def calibrar_threshold_automatico(todas_detecoes, min_t=0.20, max_t=0.70):
-    """
-    Escolhe automaticamente o threshold aplicando o método de Otsu ao
-    histograma dos scores de deteção.
-
-    Otsu encontra o limiar que separa as deteções em duas classes
-    (provável fundo/falso positivo vs. provável maçã) minimizando a
-    variância intra-classe (ou, de forma equivalente, maximizando a
-    variância entre classes). Isto adapta-se à distribuição real dos
-    scores de cada imagem, em vez de usar um corte fixo.
-
-    Aplica-se ainda um mínimo de 0.35 e um máximo de max_t para evitar
-    thresholds degenerados quando a distribuição de scores é pouco
-    informativa (ex.: poucas deteções, ou todos os scores muito
-    próximos entre si).
-    """
     if len(todas_detecoes) < 5:
         return 0.45
-
-    scores = np.array([r['score'] for r in todas_detecoes], dtype=np.float64)
-
-    # Otsu precisa de um histograma — discretizar os scores em 256 bins
-    # no intervalo [0, 1], tal como se faria com intensidades de pixel.
-    hist, bin_edges = np.histogram(scores, bins=256, range=(0.0, 1.0))
-    hist = hist.astype(np.float64)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-    if hist.sum() == 0:
-        return 0.45
-
-    prob = hist / hist.sum()
-    omega = np.cumsum(prob)                      # peso acumulado da classe "baixa"
-    mu = np.cumsum(prob * bin_centers)            # média acumulada
-    mu_total = mu[-1]
-
-    # Variância entre classes para cada limiar candidato k
-    with np.errstate(divide='ignore', invalid='ignore'):
-        numerador = (mu_total * omega - mu) ** 2
-        denominador = omega * (1.0 - omega)
-        variancia_entre_classes = np.where(denominador > 0, numerador / denominador, 0.0)
-
-    k_otimo = int(np.argmax(variancia_entre_classes))
-    threshold_otsu = float(bin_centers[k_otimo])
-
-    # Garantir mínimo de 0.35 e máximo de max_t
-    threshold_final = max(min(threshold_otsu, max_t), max(min_t, 0.35))
-    return round(threshold_final, 2)
-
-
-# ---------- Funções de inferência ----------
+    scores = np.array([r['score'] for r in todas_detecoes])
+    threshold_percentil = float(np.percentile(scores, 70))
+    return round(max(min(threshold_percentil, max_t), max(min_t, 0.35)), 2)
 
 def prever_doenca(imagem_pil):
     import tensorflow as tf
     modelo, classes = carregar_modelo_doencas()
-    img_resized = imagem_pil.resize(IMG_SIZE)
-    img_array = np.array(img_resized)
-    if img_array.shape[-1] == 4:
-        img_array = img_array[..., :3]
-    img_array = np.expand_dims(img_array, axis=0)
-    preds = modelo.predict(img_array, verbose=0)[0]
+    img = imagem_pil.resize(IMG_SIZE)
+    arr = np.array(img)
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    arr = np.expand_dims(arr, axis=0)
+    preds = modelo.predict(arr, verbose=0)[0]
     idx_top = np.argsort(preds)[::-1][:3]
     return [(classes[i], float(preds[i])) for i in idx_top]
 
+def contar_minneapple(imagem_pil, conf=0.35):
+    modelo = carregar_minneapple()
+    res = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=960, verbose=False)[0]
+    return len(res.boxes), res.plot()[:, :, ::-1]
 
-def contar_frutos_yolo(imagem_pil, conf=0.35):
-    modelo = carregar_modelo_frutos()
-    resultado = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=960, verbose=False)[0]
-    n_frutos = len(resultado.boxes)
-    img_anotada = resultado.plot()[:, :, ::-1]
-    return n_frutos, img_anotada
-
+def contar_fruits_veg(imagem_pil, conf=0.35, fruto_filtro=None):
+    modelo = carregar_fruits_veg()
+    res = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=640, verbose=False)[0]
+    img_anotada = res.plot()[:, :, ::-1]
+    contagens = {}
+    for box in res.boxes:
+        cls_id = int(box.cls)
+        nome = modelo.names[cls_id]
+        contagens[nome] = contagens.get(nome, 0) + 1
+    if fruto_filtro and fruto_filtro != "Todos":
+        total = contagens.get(fruto_filtro, 0)
+    else:
+        total = len(res.boxes)
+    return total, img_anotada, contagens
 
 def _iou(a, b):
-    ax1, ay1, ax2, ay2 = a['box']['xmin'], a['box']['ymin'], a['box']['xmax'], a['box']['ymax']
-    bx1, by1, bx2, by2 = b['box']['xmin'], b['box']['ymin'], b['box']['xmax'], b['box']['ymax']
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    area_a = (ax2 - ax1) * (ay2 - ay1)
-    area_b = (bx2 - bx1) * (by2 - by1)
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0
+    ax1,ay1,ax2,ay2 = a['box']['xmin'],a['box']['ymin'],a['box']['xmax'],a['box']['ymax']
+    bx1,by1,bx2,by2 = b['box']['xmin'],b['box']['ymin'],b['box']['xmax'],b['box']['ymax']
+    ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+    ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+    inter = max(0,ix2-ix1)*max(0,iy2-iy1)
+    ua = (ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-inter
+    return inter/ua if ua > 0 else 0
 
-
-def contar_frutos_owlv2(imagem_pil, tile_size=500, overlap=0.35):
+def contar_owlv2(imagem_pil, tile_size=500, overlap=0.35):
     detector = carregar_owlv2()
     img_np = np.array(imagem_pil)
     H, W = img_np.shape[:2]
     queries = ["apple", "red apple", "apple on ground"]
-
     step = int(tile_size * (1 - overlap))
     ys = list(range(0, max(1, H - tile_size + 1), step))
     xs = list(range(0, max(1, W - tile_size + 1), step))
-    if not ys or ys[-1] + tile_size < H:
-        ys.append(max(0, H - tile_size))
-    if not xs or xs[-1] + tile_size < W:
-        xs.append(max(0, W - tile_size))
-
-    # Fase 1: recolher TODAS as deteções com threshold mínimo
-    todas = []
-    total_tiles = len(ys) * len(xs)
+    if not ys or ys[-1] + tile_size < H: ys.append(max(0, H - tile_size))
+    if not xs or xs[-1] + tile_size < W: xs.append(max(0, W - tile_size))
+    todas, total_tiles = [], len(ys) * len(xs)
     prog = st.progress(0, text="A analisar imagem em janelas...")
-
     for ti, y0 in enumerate(ys):
         for tj, x0 in enumerate(xs):
-            y1_t = min(y0 + tile_size, H)
-            x1_t = min(x0 + tile_size, W)
-            tile = imagem_pil.crop((x0, y0, x1_t, y1_t))
-            res = detector(tile, candidate_labels=queries)
-            for r in res:
-                if r['score'] < 0.10:  # só eliminar scores muito baixos
-                    continue
+            tile = imagem_pil.crop((x0, y0, min(x0+tile_size,W), min(y0+tile_size,H)))
+            for r in detector(tile, candidate_labels=queries):
+                if r['score'] < 0.10: continue
                 box = r['box']
-                todas.append({
-                    'score': r['score'],
-                    'label': r['label'],
-                    'box': {
-                        'xmin': box['xmin'] + x0,
-                        'ymin': box['ymin'] + y0,
-                        'xmax': box['xmax'] + x0,
-                        'ymax': box['ymax'] + y0,
-                    }
-                })
-        prog.progress(min((ti + 1) / len(ys), 1.0),
-                      text=f"A processar... {(ti+1)*len(xs)}/{total_tiles} tiles")
-
+                todas.append({'score': r['score'], 'label': r['label'],
+                    'box': {'xmin': box['xmin']+x0, 'ymin': box['ymin']+y0,
+                            'xmax': box['xmax']+x0, 'ymax': box['ymax']+y0}})
+        prog.progress(min((ti+1)/len(ys), 1.0), text=f"A processar... {(ti+1)*len(xs)}/{total_tiles} tiles")
     prog.empty()
-
-    # Fase 2: calibrar threshold automaticamente (Otsu)
     threshold_auto = calibrar_threshold_automatico(todas)
-
-    # Fase 3: filtrar com threshold calibrado + NMS
-    filtradas = [r for r in todas if r['score'] >= threshold_auto]
-    sorted_det = sorted(filtradas, key=lambda x: -x['score'])
     kept = []
-    for r in sorted_det:
+    for r in sorted([x for x in todas if x['score'] >= threshold_auto], key=lambda x: -x['score']):
         if all(_iou(r, k) < 0.65 for k in kept):
             kept.append(r)
-
-    # Desenhar caixas com PIL
     from PIL import ImageDraw
-    img_pil_out = Image.fromarray(img_np.copy())
-    draw = ImageDraw.Draw(img_pil_out)
+    out = Image.fromarray(img_np.copy())
+    draw = ImageDraw.Draw(out)
     for r in kept:
-        box = r['box']
-        x1, y1, x2, y2 = int(box['xmin']), int(box['ymin']), int(box['xmax']), int(box['ymax'])
-        draw.rectangle([x1, y1, x2, y2], outline=(0, 200, 0), width=2)
-        draw.text((x1, max(y1 - 12, 0)), f"{r['score']:.2f}", fill=(0, 200, 0))
-
-    return len(kept), np.array(img_pil_out), threshold_auto
-
+        b = r['box']
+        x1,y1,x2,y2 = int(b['xmin']),int(b['ymin']),int(b['xmax']),int(b['ymax'])
+        draw.rectangle([x1,y1,x2,y2], outline=(0,200,0), width=2)
+        draw.text((x1, max(y1-12,0)), f"{r['score']:.2f}", fill=(0,200,0))
+    return len(kept), np.array(out), threshold_auto
 
 def detetar_ervas(imagem_pil, conf=0.4):
     modelo = carregar_modelo_ervas()
-    resultado = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=640, verbose=False)[0]
-    img_anotada = resultado.plot()[:, :, ::-1]
-    n_crop = sum(1 for c in resultado.boxes.cls if int(c) == 0)
-    n_weed = sum(1 for c in resultado.boxes.cls if int(c) == 1)
+    res = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=640, verbose=False)[0]
+    img_anotada = res.plot()[:, :, ::-1]
+    n_crop = sum(1 for c in res.boxes.cls if int(c) == 0)
+    n_weed = sum(1 for c in res.boxes.cls if int(c) == 1)
     return n_crop, n_weed, img_anotada
-
 
 # ---------- Interface ----------
 
@@ -269,43 +196,52 @@ st.title("🌱 Visão Computacional Aplicada à Agricultura Inteligente")
 st.caption("Sistema de apoio à decisão com modelos de Deep Learning para deteção de doenças, contagem de frutos e deteção de ervas daninhas.")
 
 st.sidebar.header("Escolha o modelo")
-opcao = st.sidebar.radio(
-    "Funcionalidade:",
-    [
-        "🍃 Classificação de Doenças (Folhas)",
-        "🍎 Contagem de Frutos (Maçãs)",
-        "🌿 Deteção de Ervas Daninhas",
-    ]
-)
+opcao = st.sidebar.radio("Funcionalidade:", [
+    "🍃 Classificação de Doenças (Folhas)",
+    "🍎 Contagem de Frutos",
+    "🌿 Deteção de Ervas Daninhas",
+])
+
+fruto_filtro = "Todos"
+tile_size = 500
+conf_threshold = 0.4
 
 if opcao.startswith("🍎"):
     st.sidebar.markdown("---")
     st.sidebar.subheader("Pipeline de deteção")
-    pipeline_frutos = st.sidebar.radio(
-        "Método:",
-        ["YOLOv8 (rápido)", "OWLv2 Sliding Window (avançado)"],
-        help="YOLOv8: treinado no MinneApple, rápido.\nOWLv2: zero-shot com calibração automática, mais lento."
-    )
-    if pipeline_frutos == "YOLOv8 (rápido)":
-        conf_threshold = st.sidebar.slider("Confiança mínima (conf)", 0.1, 0.9, 0.35, 0.05)
+    pipeline_frutos = st.sidebar.radio("Método:", [
+        "YOLOv8 MinneApple (maçãs, especializado)",
+        "YOLOv8 Frutas & Vegetais (63 classes)",
+        "OWLv2 Sliding Window (zero-shot)",
+    ])
+    if pipeline_frutos.startswith("YOLOv8 MinneApple"):
+        conf_threshold = st.sidebar.slider("Confiança mínima", 0.1, 0.9, 0.35, 0.05)
+    elif pipeline_frutos.startswith("YOLOv8 Frutas"):
+        conf_threshold = st.sidebar.slider("Confiança mínima", 0.1, 0.9, 0.35, 0.05)
+        frutos_disponiveis = [
+            "Todos", "apple", "banana", "papaya", "pineapple",
+            "watermelon", "coconut/cocoanut", "orange/orange fruit",
+            "grape", "tomato", "avocado", "lemon", "lime", "peach", "pear",
+            "mango", "kiwi fruit", "melon", "cherry",
+        ]
+        fruto_filtro = st.sidebar.selectbox("Filtrar por fruto:", frutos_disponiveis)
     else:
         tile_size = st.sidebar.select_slider("Tamanho do tile (px)", [300, 400, 500, 640], value=500)
-        st.sidebar.caption("⚠️ O modo avançado pode demorar 2–4 minutos. O threshold é calibrado automaticamente para cada imagem.")
+        st.sidebar.caption("⚠️ Modo avançado: 2–4 minutos. Threshold calibrado automaticamente.")
 
 elif opcao.startswith("🌿"):
-    conf_threshold = st.sidebar.slider("Confiança mínima (conf)", 0.1, 0.9, 0.4, 0.05)
+    conf_threshold = st.sidebar.slider("Confiança mínima", 0.1, 0.9, 0.4, 0.05)
 
 uploaded_file = st.file_uploader("Carregar imagem", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
     imagem = Image.open(uploaded_file).convert("RGB")
-
     col1, col2 = st.columns(2)
-
     with col1:
         st.subheader("Imagem original")
-        st.image(imagem, use_container_width=True)
+        st.image(imagem, use_column_width=True)
 
+    # Doenças
     if opcao.startswith("🍃"):
         with st.spinner("A classificar a doença..."):
             resultados = prever_doenca(imagem)
@@ -313,50 +249,49 @@ if uploaded_file is not None:
             st.subheader("Resultado")
             classe_top, conf_top = resultados[0]
             st.success(f"**{traduzir_classe(classe_top)}**")
-            st.metric("Confiança", f"{conf_top * 100:.1f}%")
+            st.metric("Confiança", f"{conf_top*100:.1f}%")
             st.write("Outras possibilidades:")
             for classe, conf in resultados[1:]:
-                st.write(f"- {traduzir_classe(classe)}: {conf * 100:.1f}%")
-        st.caption("⚠️ Modelo EfficientNetB0 treinado no dataset PlantVillage (38 classes, 99% accuracy em teste).")
+                st.write(f"- {traduzir_classe(classe)}: {conf*100:.1f}%")
+        st.caption("Modelo: EfficientNetB0 treinado no PlantVillage (38 classes, 99% accuracy no teste).")
 
+    # Contagem de frutos
     elif opcao.startswith("🍎"):
-        if pipeline_frutos == "YOLOv8 (rápido)":
-            with st.spinner("A contar maçãs com YOLOv8..."):
-                n_frutos, img_anotada = contar_frutos_yolo(imagem, conf=conf_threshold)
+        if pipeline_frutos.startswith("YOLOv8 MinneApple"):
+            with st.spinner("A contar maçãs com YOLOv8 MinneApple..."):
+                n, img_anotada = contar_minneapple(imagem, conf=conf_threshold)
             with col2:
-                st.subheader("Resultado — YOLOv8")
-                st.metric("🍎 Maçãs detetadas", n_frutos)
-                st.image(img_anotada, use_container_width=True)
-            st.caption("⚠️ YOLOv8n treinado no MinneApple (mAP50: 0.865, erro agregado: 0.39%). Limitado a maçãs na árvore.")
+                st.subheader("Resultado — MinneApple")
+                st.metric("🍎 Maçãs detetadas", n)
+                st.image(img_anotada, use_column_width=True)
+            st.caption("Modelo: YOLOv8n MinneApple (mAP50: 0.865, erro de contagem agregado: 0.39%). Especializado em maçãs na árvore.")
+
+        elif pipeline_frutos.startswith("YOLOv8 Frutas"):
+            with st.spinner("A detetar frutas e vegetais..."):
+                n, img_anotada, contagens = contar_fruits_veg(imagem, conf=conf_threshold, fruto_filtro=fruto_filtro)
+            with col2:
+                st.subheader("Resultado — Frutas & Vegetais (63 classes)")
+                st.metric("🍓 Objetos detetados", n)
+                st.image(img_anotada, use_column_width=True)
+            if contagens:
+                st.write("**Contagem por classe:**")
+                cols = st.columns(4)
+                for i, (nome, count) in enumerate(sorted(contagens.items(), key=lambda x: -x[1])):
+                    cols[i % 4].metric(nome, count)
+            st.caption("Modelo: YOLOv8 treinado no LVIS (63 classes de frutas e vegetais). Generalista.")
 
         else:
-            st.info("🔍 Modo avançado: a imagem será processada em tiles sobrepostos com OWLv2. O threshold será calibrado automaticamente para esta imagem. Aguarde...")
-            with st.spinner("A processar com OWLv2 Sliding Window..."):
-                n_frutos, img_anotada, threshold_auto = contar_frutos_owlv2(
-                    imagem, tile_size=tile_size, overlap=0.35)
+            st.info("🔍 OWLv2 Sliding Window — threshold calibrado automaticamente. Aguarde...")
+            with st.spinner("A processar..."):
+                n, img_anotada, threshold_auto = contar_owlv2(imagem, tile_size=tile_size)
             with col2:
                 st.subheader("Resultado — OWLv2 (zero-shot)")
-                st.metric("🍎 Maçãs detetadas", n_frutos)
-                st.image(img_anotada, use_container_width=True)
+                st.metric("🍎 Maçãs detetadas", n)
+                st.image(img_anotada, use_column_width=True)
+            st.sidebar.success(f"🎯 Threshold automático: **{threshold_auto}**")
+            st.caption(f"Modelo: OWLv2 zero-shot com calibração por percentil. Threshold: {threshold_auto} | Tile: {tile_size}px.")
 
-            st.sidebar.success(f"🎯 Threshold calibrado automaticamente: **{threshold_auto}**")
-
-            with st.expander("📊 Comparar com YOLOv8 (mesma imagem)"):
-                if st.button("▶ Correr comparação YOLOv8 vs OWLv2"):
-                    with st.spinner("A correr YOLOv8 para comparação..."):
-                        n_yolo, img_yolo = contar_frutos_yolo(imagem, conf=0.35)
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.metric("YOLOv8", n_yolo)
-                        st.image(img_yolo, use_container_width=True)
-                    with c2:
-                        st.metric("OWLv2 Sliding Window", n_frutos, delta=n_frutos - n_yolo)
-                        st.image(img_anotada, use_container_width=True)
-                else:
-                    st.caption("Clique no botão acima para correr o YOLOv8 e comparar lado a lado.")
-
-            st.caption(f"⚠️ OWLv2 (google/owlv2-base-patch16-ensemble) — zero-shot com calibração Otsu automática. Threshold: {threshold_auto} | Tile: {tile_size}px | Overlap: 35%.")
-
+    # Ervas daninhas
     else:
         with st.spinner("A detetar plantas..."):
             n_crop, n_weed, img_anotada = detetar_ervas(imagem, conf=conf_threshold)
@@ -365,8 +300,8 @@ if uploaded_file is not None:
             c1, c2 = st.columns(2)
             c1.metric("🌾 Cultura (crop)", n_crop)
             c2.metric("🌿 Erva daninha (weed)", n_weed)
-            st.image(img_anotada, use_container_width=True)
-        st.caption("⚠️ Modelo YOLOv8n treinado em dataset de sésamo + ervas daninhas (mAP50: 0.826).")
+            st.image(img_anotada, use_column_width=True)
+        st.caption("Modelo: YOLOv8n treinado em dataset de sésamo + ervas daninhas (mAP50: 0.826).")
 
 else:
     st.info("Carregue uma imagem para começar.")
