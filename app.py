@@ -104,30 +104,19 @@ def carregar_owlv2():
 
 def calibrar_threshold_automatico(todas_detecoes, min_t=0.20, max_t=0.70):
     """
-    Escolhe automaticamente o threshold ótimo baseado na distribuição
-    dos scores de confiança usando o método de Otsu adaptado.
-    Maximiza a variância inter-classe entre deteções fortes e fracas.
+    Escolhe automaticamente o threshold baseado no percentil 70 dos scores.
+    Garante que só os 30% scores mais altos passam, adaptando-se
+    automaticamente à densidade de objetos na imagem.
+    Aplica também um mínimo de 0.35 para evitar falsos positivos.
     """
     if len(todas_detecoes) < 5:
-        return 0.45  # fallback se poucas deteções
+        return 0.45
 
     scores = np.array([r['score'] for r in todas_detecoes])
-    melhor_threshold = 0.45
-    melhor_variancia = -1
-
-    for t in np.arange(min_t, max_t, 0.01):
-        acima = scores[scores >= t]
-        abaixo = scores[scores < t]
-        if len(acima) < 2 or len(abaixo) < 2:
-            continue
-        w_acima = len(acima) / len(scores)
-        w_abaixo = len(abaixo) / len(scores)
-        variancia = w_acima * w_abaixo * (acima.mean() - abaixo.mean()) ** 2
-        if variancia > melhor_variancia:
-            melhor_variancia = variancia
-            melhor_threshold = t
-
-    return round(float(melhor_threshold), 2)
+    threshold_percentil = float(np.percentile(scores, 70))
+    # Garantir mínimo de 0.35 e máximo de max_t
+    threshold_final = max(min(threshold_percentil, max_t), max(min_t, 0.35))
+    return round(threshold_final, 2)
 
 
 # ---------- Funções de inferência ----------
@@ -217,7 +206,7 @@ def contar_frutos_owlv2(imagem_pil, tile_size=500, overlap=0.35):
     sorted_det = sorted(filtradas, key=lambda x: -x['score'])
     kept = []
     for r in sorted_det:
-        if all(_iou(r, k) < 0.55 for k in kept):
+        if all(_iou(r, k) < 0.65 for k in kept):
             kept.append(r)
 
     # Desenhar caixas com PIL
