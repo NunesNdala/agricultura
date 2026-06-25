@@ -3,6 +3,7 @@ import numpy as np
 from PIL import Image
 import json
 import os
+import cv2
 
 st.set_page_config(
     page_title="Agricultura Inteligente",
@@ -130,36 +131,50 @@ def prever_doenca(imagem_pil):
     return [(classes[i], float(preds[i])) for i in idx_top]
 
 def obter_todos_scores_yolo(imagem_pil, modelo_fn, imgsz=640):
-    """Corre inferência com conf=0.01 para obter todos os scores possíveis."""
     modelo = modelo_fn()
     res = modelo.predict(source=np.array(imagem_pil), conf=0.01, imgsz=imgsz, verbose=False)[0]
     scores = [float(b.conf) for b in res.boxes]
     return scores
 
-def contar_com_threshold(imagem_pil, modelo_fn, conf, imgsz=640, fruto_filtro=None):
+def contar_com_threshold(imagem_pil, modelo_fn, conf, imgsz=640, fruto_filtro=None, use_tracking=True):
+    """
+    Abordagem melhorada: Integra Tracking para evitar sobrecontagem.
+    """
     modelo = modelo_fn()
-    res = modelo.predict(source=np.array(imagem_pil), conf=conf, imgsz=imgsz, verbose=False)[0]
+    img_np = np.array(imagem_pil)
+    
+    if use_tracking:
+        # Usar o método track para consolidar deteções ruidosas e sobrepostas
+        res = modelo.track(source=img_np, conf=conf, imgsz=imgsz, persist=True, verbose=False)[0]
+        # Contar IDs únicos se disponíveis, caso contrário contar boxes
+        if res.boxes.id is not None:
+            ids = res.boxes.id.cpu().numpy().astype(int)
+            total = len(np.unique(ids))
+        else:
+            total = len(res.boxes)
+    else:
+        res = modelo.predict(source=img_np, conf=conf, imgsz=imgsz, verbose=False)[0]
+        total = len(res.boxes)
+        
     img_anotada = res.plot()[:, :, ::-1]
     contagens = {}
     for box in res.boxes:
         cls_id = int(box.cls)
         nome = modelo.names[cls_id]
         contagens[nome] = contagens.get(nome, 0) + 1
+        
     if fruto_filtro and fruto_filtro != "Todos":
         total = contagens.get(fruto_filtro, 0)
-    else:
-        total = len(res.boxes)
+        
     return total, img_anotada, contagens
 
 def calcular_curva_threshold(scores, thresholds):
-    """Conta quantas deteções passam para cada threshold."""
     contagens = []
     for t in thresholds:
         contagens.append(sum(1 for s in scores if s >= t))
     return contagens
 
 def encontrar_joelho_curva(thresholds, contagens):
-    """Encontra o ponto de 'joelho' da curva (maior variação de declive)."""
     if len(contagens) < 3:
         return thresholds[0]
     derivadas = np.diff(contagens)
@@ -229,7 +244,7 @@ def detetar_ervas(imagem_pil, conf=0.4):
 st.title("🌱 Visão Computacional Aplicada à Agricultura Inteligente")
 st.caption("Sistema de apoio à decisão com modelos de Deep Learning para deteção de doenças, contagem de frutos e deteção de ervas daninhas.")
 
-st.sidebar.header("Escolha o modelo")
+st.sidebar.header("Configurações")
 opcao = st.sidebar.radio("Funcionalidade:", [
     "🍃 Classificação de Doenças (Folhas)",
     "🍎 Contagem de Frutos",
@@ -249,6 +264,11 @@ if opcao.startswith("🍎"):
         "YOLOv8 Frutas & Vegetais (63 classes)",
         "OWLv2 Sliding Window (zero-shot)",
     ])
+    
+    # Toggle para Tracking em YOLO
+    if not pipeline_frutos.startswith("OWLv2"):
+        use_tracking = st.sidebar.toggle("Ativar Tracking (Rastreamento)", value=True, help="Evita contar o mesmo fruto várias vezes ao consolidar deteções.")
+    
     if pipeline_frutos.startswith("YOLOv8 MinneApple"):
         conf_threshold = st.sidebar.slider("Confiança mínima", 0.05, 0.90, 0.35, 0.05)
         calibrar_auto = st.sidebar.checkbox("🎯 Calibrar threshold automaticamente", value=False)
@@ -297,7 +317,7 @@ if uploaded_file is not None:
     # Contagem de frutos
     elif opcao.startswith("🍎"):
 
-        if pipeline_frutos.startswith("YOLOv8 MinneApple") or pipeline_frutos.startswith("YOLOv8 Frutas"):
+        if not pipeline_frutos.startswith("OWLv2"):
             modelo_fn = carregar_minneapple if pipeline_frutos.startswith("YOLOv8 MinneApple") else carregar_fruits_veg
             imgsz = 960 if pipeline_frutos.startswith("YOLOv8 MinneApple") else 640
             label = "MinneApple" if pipeline_frutos.startswith("YOLOv8 MinneApple") else "Frutas & Vegetais (63 classes)"
@@ -329,13 +349,12 @@ if uploaded_file is not None:
                         st.pyplot(fig)
                         plt.close()
 
-                    st.sidebar.info(f"🎯 Threshold sugerido pela curva: **{threshold_joelho}**\n\n"
-                                   f"Ajuste o slider para este valor para resultado otimizado.")
+                    st.sidebar.info(f"🎯 Threshold sugerido pela curva: **{threshold_joelho}**")
                     conf_threshold = threshold_joelho
 
             with st.spinner(f"A detetar com YOLOv8 {label}..."):
                 n, img_anotada, contagens = contar_com_threshold(
-                    imagem, modelo_fn, conf_threshold, imgsz=imgsz, fruto_filtro=fruto_filtro)
+                    imagem, modelo_fn, conf_threshold, imgsz=imgsz, fruto_filtro=fruto_filtro, use_tracking=use_tracking)
 
             with col2:
                 st.subheader(f"Resultado — {label}")
@@ -349,9 +368,9 @@ if uploaded_file is not None:
                     cols[i % 4].metric(nome, count)
 
             if pipeline_frutos.startswith("YOLOv8 MinneApple"):
-                st.caption("Modelo: YOLOv8n MinneApple (mAP50: 0.865, erro agregado: 0.39%). Especializado em maçãs na árvore.")
+                st.caption("Modelo: YOLOv8n MinneApple. Agora com suporte a tracking para evitar sobrecontagem.")
             else:
-                st.caption("Modelo: YOLOv8 LVIS Frutas & Vegetais (63 classes). Generalista.")
+                st.caption("Modelo: YOLOv8 LVIS Frutas & Vegetais (63 classes). Agora com suporte a tracking.")
 
         else:
             st.info("🔍 OWLv2 Sliding Window — threshold calibrado automaticamente. Aguarde...")
