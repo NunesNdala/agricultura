@@ -136,36 +136,71 @@ def obter_todos_scores_yolo(imagem_pil, modelo_fn, imgsz=640):
     scores = [float(b.conf) for b in res.boxes]
     return scores
 
-def contar_com_threshold(imagem_pil, modelo_fn, conf, imgsz=640, fruto_filtro=None, use_tracking=True):
+def _iou_yolo(boxA, boxB):
+    # box format: [x1, y1, x2, y2]
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+    return iou
+
+def contar_com_threshold(imagem_pil, modelo_fn, conf, imgsz=640, fruto_filtro=None, iou_threshold=0.45):
     """
-    Abordagem melhorada: Integra Tracking para evitar sobrecontagem.
+    Abordagem corrigida: Usa NMS manual para evitar sobrecontagem sem depender da lib 'lap' (tracking).
     """
     modelo = modelo_fn()
     img_np = np.array(imagem_pil)
     
-    if use_tracking:
-        # Usar o método track para consolidar deteções ruidosas e sobrepostas
-        res = modelo.track(source=img_np, conf=conf, imgsz=imgsz, persist=True, verbose=False)[0]
-        # Contar IDs únicos se disponíveis, caso contrário contar boxes
-        if res.boxes.id is not None:
-            ids = res.boxes.id.cpu().numpy().astype(int)
-            total = len(np.unique(ids))
-        else:
-            total = len(res.boxes)
-    else:
-        res = modelo.predict(source=img_np, conf=conf, imgsz=imgsz, verbose=False)[0]
-        total = len(res.boxes)
+    # Executar predição normal
+    res = modelo.predict(source=img_np, conf=conf, imgsz=imgsz, verbose=False)[0]
+    
+    # Extrair caixas, scores e classes
+    boxes = res.boxes.xyxy.cpu().numpy()
+    scores = res.boxes.conf.cpu().numpy()
+    classes = res.boxes.cls.cpu().numpy()
+    
+    # Aplicar NMS manual para filtrar sobreposições exageradas
+    # Ordenar por score descendente
+    indices = np.argsort(scores)[::-1]
+    keep = []
+    
+    while len(indices) > 0:
+        i = indices[0]
+        keep.append(i)
         
-    img_anotada = res.plot()[:, :, ::-1]
+        if len(indices) == 1:
+            break
+            
+        # Calcular IOU com as restantes caixas
+        ious = np.array([_iou_yolo(boxes[i], boxes[j]) for j in indices[1:]])
+        
+        # Manter apenas as que têm IOU abaixo do threshold
+        filtered_indices = np.where(ious < iou_threshold)[0]
+        indices = indices[filtered_indices + 1]
+
+    # Filtrar resultados finais
+    final_boxes = boxes[keep]
+    final_classes = classes[keep]
+    
     contagens = {}
-    for box in res.boxes:
-        cls_id = int(box.cls)
-        nome = modelo.names[cls_id]
+    total = 0
+    for cls_id in final_classes:
+        nome = modelo.names[int(cls_id)]
+        if fruto_filtro and fruto_filtro != "Todos":
+            if nome == fruto_filtro:
+                total += 1
+        else:
+            total += 1
         contagens[nome] = contagens.get(nome, 0) + 1
         
-    if fruto_filtro and fruto_filtro != "Todos":
-        total = contagens.get(fruto_filtro, 0)
-        
+    # Gerar imagem anotada (usando os resultados originais do plot, mas a contagem é a nossa filtrada)
+    # Nota: O plot do YOLO pode ainda mostrar as caixas sobrepostas, mas a métrica será a correta.
+    img_anotada = res.plot()[:, :, ::-1]
+    
     return total, img_anotada, contagens
 
 def calcular_curva_threshold(scores, thresholds):
@@ -265,9 +300,10 @@ if opcao.startswith("🍎"):
         "OWLv2 Sliding Window (zero-shot)",
     ])
     
-    # Toggle para Tracking em YOLO
+    # Slider de IOU para controlar sobreposição
     if not pipeline_frutos.startswith("OWLv2"):
-        use_tracking = st.sidebar.toggle("Ativar Tracking (Rastreamento)", value=True, help="Evita contar o mesmo fruto várias vezes ao consolidar deteções.")
+        iou_threshold = st.sidebar.slider("Filtro de Sobreposição (IOU)", 0.1, 0.9, 0.45, 0.05, 
+                                         help="Valores mais baixos eliminam mais caixas sobrepostas, evitando a sobrecontagem.")
     
     if pipeline_frutos.startswith("YOLOv8 MinneApple"):
         conf_threshold = st.sidebar.slider("Confiança mínima", 0.05, 0.90, 0.35, 0.05)
@@ -354,7 +390,7 @@ if uploaded_file is not None:
 
             with st.spinner(f"A detetar com YOLOv8 {label}..."):
                 n, img_anotada, contagens = contar_com_threshold(
-                    imagem, modelo_fn, conf_threshold, imgsz=imgsz, fruto_filtro=fruto_filtro, use_tracking=use_tracking)
+                    imagem, modelo_fn, conf_threshold, imgsz=imgsz, fruto_filtro=fruto_filtro, iou_threshold=iou_threshold)
 
             with col2:
                 st.subheader(f"Resultado — {label}")
@@ -368,9 +404,9 @@ if uploaded_file is not None:
                     cols[i % 4].metric(nome, count)
 
             if pipeline_frutos.startswith("YOLOv8 MinneApple"):
-                st.caption("Modelo: YOLOv8n MinneApple. Agora com suporte a tracking para evitar sobrecontagem.")
+                st.caption("Modelo: YOLOv8n MinneApple. Filtro NMS ativo para evitar sobrecontagem.")
             else:
-                st.caption("Modelo: YOLOv8 LVIS Frutas & Vegetais (63 classes). Agora com suporte a tracking.")
+                st.caption("Modelo: YOLOv8 LVIS Frutas & Vegetais (63 classes). Filtro NMS ativo.")
 
         else:
             st.info("🔍 OWLv2 Sliding Window — threshold calibrado automaticamente. Aguarde...")
