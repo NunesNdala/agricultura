@@ -91,11 +91,6 @@ def carregar_owlv2():
         device=0 if torch.cuda.is_available() else -1,
     )
 
-def calibrar_threshold_automatico(todas_detecoes, min_t=0.30):
-    if not todas_detecoes: return min_t
-    scores = np.array([r['score'] for r in todas_detecoes], dtype=np.float64)
-    return round(float(np.percentile(scores, 75)), 2) # Usar percentil 75 para ser mais seletivo
-
 def prever_doenca(imagem_pil):
     import tensorflow as tf
     modelo, classes = carregar_modelo_doencas()
@@ -111,7 +106,14 @@ def detetar_frutas_veg(imagem_pil, conf=0.25):
     modelo = carregar_fruits_veg()
     img_np = np.array(imagem_pil)
     res = modelo.predict(source=img_np, conf=conf, imgsz=640, verbose=False)[0]
-    return res.plot()[:, :, ::-1]
+    
+    contagens = {}
+    for box in res.boxes:
+        cls_id = int(box.cls)
+        nome = modelo.names[cls_id]
+        contagens[nome] = contagens.get(nome, 0) + 1
+        
+    return res.plot()[:, :, ::-1], contagens
 
 def _iou(a, b):
     ax1,ay1,ax2,ay2 = a['box']['xmin'],a['box']['ymin'],a['box']['xmax'],a['box']['ymax']
@@ -127,7 +129,6 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.30, min_conf=0.25):
     img_np = np.array(imagem_pil)
     H, W = img_np.shape[:2]
     
-    # ESTRATÉGIA DE CONTRASTE: Maçãs vs Folhagem/Ramos
     queries = ["ripe red apple", "green leaf", "tree branch"]
     
     step = int(tile_size * (1 - overlap))
@@ -143,15 +144,11 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.30, min_conf=0.25):
         for tj, x0 in enumerate(xs):
             tile = imagem_pil.crop((x0, y0, min(x0+tile_size,W), min(y0+tile_size,H)))
             for r in detector(tile, candidate_labels=queries):
-                # FILTRO 1: Só aceitar se for Maçã e tiver score mínimo
                 if r['label'] != "ripe red apple" or r['score'] < min_conf:
                     continue
-                
                 box = r['box']
-                # FILTRO 2: Ignorar caixas excessivamente pequenas (ruído)
                 if (box['xmax'] - box['xmin']) < 15 or (box['ymax'] - box['ymin']) < 15:
                     continue
-                    
                 todas.append({'score': r['score'], 'label': r['label'],
                     'box': {'xmin': box['xmin']+x0, 'ymin': box['ymin']+y0,
                             'xmax': box['xmax']+x0, 'ymax': box['ymax']+y0}})
@@ -159,7 +156,6 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.30, min_conf=0.25):
     
     prog.empty()
     
-    # FILTRO 3: NMS ULTRA-AGRESSIVO (IOU=0.3) para eliminar réplicas dos tiles
     kept = []
     for r in sorted(todas, key=lambda x: -x['score']):
         if all(_iou(r, k) < 0.30 for k in kept):
@@ -199,10 +195,9 @@ opcao = st.sidebar.radio("Selecione a tarefa:", [
 if opcao == "🍎 Contagem de Precisão (Maçãs)":
     st.sidebar.markdown("---")
     st.sidebar.subheader("Ajuste de Sensibilidade")
-    min_conf = st.sidebar.slider("Limiar de Confiança", 0.10, 0.80, 0.35, 0.05, 
-                                 help="Aumente para eliminar falsos positivos na folhagem.")
-    tile_size = st.sidebar.select_slider("Janela de Análise (px)", [300,400,500,640], value=500)
-    st.sidebar.success("✅ Algoritmo de contraste ativo: Maçãs vs Folhagem.")
+    min_conf = st.sidebar.slider("Limiar de Confiança", 0.10, 0.80, 0.35, 0.05)
+    tile_size = st.sidebar.select_slider("Janela de Análise (px)", [50, 100, 200, 300, 400, 500, 640], value=500)
+    st.sidebar.success("✅ Algoritmo de contraste ativo.")
 
 elif opcao == "🔍 Deteção Geral (Multiclasse)":
     conf_threshold = st.sidebar.slider("Confiança YOLO", 0.10, 0.90, 0.25, 0.05)
@@ -224,7 +219,6 @@ if uploaded_file is not None:
             st.subheader("Resultado da Contagem")
             st.metric("🍎 Maçãs Confirmadas", n)
             st.image(img_anotada, use_column_width=True)
-            st.info("ℹ️ O sistema filtrou automaticamente réplicas e confusões com folhas/ramos.")
 
     # 2. Doenças
     elif opcao == "🍃 Diagnóstico de Doenças":
@@ -236,13 +230,22 @@ if uploaded_file is not None:
             st.success(f"**{traduzir_classe(classe_top)}**")
             st.metric("Confiança", f"{conf_top*100:.1f}%")
 
-    # 3. Deteção Geral
+    # 3. Deteção Geral (Multiclasse com Tabela de Dados)
     elif opcao == "🔍 Deteção Geral (Multiclasse)":
-        with st.spinner("A detetar objetos..."):
-            img_anotada = detetar_frutas_veg(imagem, conf=conf_threshold)
+        with st.spinner("A detetar objetos e organizar dados..."):
+            img_anotada, contagens = detetar_frutas_veg(imagem, conf=conf_threshold)
         with col2:
-            st.subheader("Mapa de Deteções")
+            st.subheader("Resultados da Deteção")
             st.image(img_anotada, use_column_width=True)
+            
+            if contagens:
+                st.write("**Dados Quantitativos:**")
+                # Criar tabela de dados
+                import pandas as pd
+                df = pd.DataFrame(list(contagens.items()), columns=['Classe', 'Quantidade'])
+                st.table(df)
+            else:
+                st.warning("Nenhum objeto detetado com o threshold atual.")
 
     # 4. Ervas Daninhas
     else:
