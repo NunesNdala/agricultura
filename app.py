@@ -97,15 +97,19 @@ def carregar_owlv2():
         device=0 if torch.cuda.is_available() else -1,
     )
 
-def calibrar_threshold_automatico(todas_detecoes, min_t=0.20, max_t=0.70):
+def calibrar_threshold_automatico(todas_detecoes, min_t=0.45, max_t=0.75):
+    """
+    Calibração automática melhorada para evitar falsos positivos.
+    Aumentamos o min_t de 0.35 para 0.45.
+    """
     if len(todas_detecoes) < 5:
-        return 0.45
+        return 0.50
     scores = np.array([r['score'] for r in todas_detecoes], dtype=np.float64)
     hist, bin_edges = np.histogram(scores, bins=256, range=(0.0, 1.0))
     hist = hist.astype(np.float64)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     if hist.sum() == 0:
-        return 0.45
+        return 0.50
     prob = hist / hist.sum()
     omega = np.cumsum(prob)
     mu = np.cumsum(prob * bin_centers)
@@ -116,7 +120,8 @@ def calibrar_threshold_automatico(todas_detecoes, min_t=0.20, max_t=0.70):
         variancia = np.where(denominador > 0, numerador / denominador, 0.0)
     k_otimo = int(np.argmax(variancia))
     threshold_otsu = float(bin_centers[k_otimo])
-    return round(max(min(threshold_otsu, max_t), max(min_t, 0.35)), 2)
+    # Aplicar limites mais rigorosos
+    return round(max(min(threshold_otsu, max_t), min_t), 2)
 
 def prever_doenca(imagem_pil):
     import tensorflow as tf
@@ -137,7 +142,6 @@ def obter_todos_scores_yolo(imagem_pil, modelo_fn, imgsz=640):
     return scores
 
 def _iou_yolo(boxA, boxB):
-    # box format: [x1, y1, x2, y2]
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
@@ -149,58 +153,31 @@ def _iou_yolo(boxA, boxB):
     return iou
 
 def contar_com_threshold(imagem_pil, modelo_fn, conf, imgsz=640, fruto_filtro=None, iou_threshold=0.45):
-    """
-    Abordagem corrigida: Usa NMS manual para evitar sobrecontagem sem depender da lib 'lap' (tracking).
-    """
     modelo = modelo_fn()
     img_np = np.array(imagem_pil)
-    
-    # Executar predição normal
     res = modelo.predict(source=img_np, conf=conf, imgsz=imgsz, verbose=False)[0]
-    
-    # Extrair caixas, scores e classes
     boxes = res.boxes.xyxy.cpu().numpy()
     scores = res.boxes.conf.cpu().numpy()
     classes = res.boxes.cls.cpu().numpy()
-    
-    # Aplicar NMS manual para filtrar sobreposições exageradas
-    # Ordenar por score descendente
     indices = np.argsort(scores)[::-1]
     keep = []
-    
     while len(indices) > 0:
         i = indices[0]
         keep.append(i)
-        
-        if len(indices) == 1:
-            break
-            
-        # Calcular IOU com as restantes caixas
+        if len(indices) == 1: break
         ious = np.array([_iou_yolo(boxes[i], boxes[j]) for j in indices[1:]])
-        
-        # Manter apenas as que têm IOU abaixo do threshold
         filtered_indices = np.where(ious < iou_threshold)[0]
         indices = indices[filtered_indices + 1]
-
-    # Filtrar resultados finais
-    final_boxes = boxes[keep]
     final_classes = classes[keep]
-    
     contagens = {}
     total = 0
     for cls_id in final_classes:
         nome = modelo.names[int(cls_id)]
         if fruto_filtro and fruto_filtro != "Todos":
-            if nome == fruto_filtro:
-                total += 1
-        else:
-            total += 1
+            if nome == fruto_filtro: total += 1
+        else: total += 1
         contagens[nome] = contagens.get(nome, 0) + 1
-        
-    # Gerar imagem anotada (usando os resultados originais do plot, mas a contagem é a nossa filtrada)
-    # Nota: O plot do YOLO pode ainda mostrar as caixas sobrepostas, mas a métrica será a correta.
     img_anotada = res.plot()[:, :, ::-1]
-    
     return total, img_anotada, contagens
 
 def calcular_curva_threshold(scores, thresholds):
@@ -210,12 +187,10 @@ def calcular_curva_threshold(scores, thresholds):
     return contagens
 
 def encontrar_joelho_curva(thresholds, contagens):
-    if len(contagens) < 3:
-        return thresholds[0]
+    if len(contagens) < 3: return thresholds[0]
     derivadas = np.diff(contagens)
     segunda_derivada = np.diff(derivadas)
-    if len(segunda_derivada) == 0:
-        return thresholds[0]
+    if len(segunda_derivada) == 0: return thresholds[0]
     idx_joelho = int(np.argmax(np.abs(segunda_derivada))) + 1
     return round(float(thresholds[idx_joelho]), 2)
 
@@ -232,7 +207,8 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.35):
     detector = carregar_owlv2()
     img_np = np.array(imagem_pil)
     H, W = img_np.shape[:2]
-    queries = ["apple", "red apple", "apple on ground"]
+    # Queries mais específicas para evitar detetar folhas verdes
+    queries = ["ripe red apple", "apple fruit", "round red apple"]
     step = int(tile_size * (1 - overlap))
     ys = list(range(0, max(1, H - tile_size + 1), step))
     xs = list(range(0, max(1, W - tile_size + 1), step))
@@ -244,7 +220,7 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.35):
         for tj, x0 in enumerate(xs):
             tile = imagem_pil.crop((x0, y0, min(x0+tile_size,W), min(y0+tile_size,H)))
             for r in detector(tile, candidate_labels=queries):
-                if r['score'] < 0.10: continue
+                if r['score'] < 0.20: continue # Ignorar scores muito baixos logo no início
                 box = r['box']
                 todas.append({'score': r['score'], 'label': r['label'],
                     'box': {'xmin': box['xmin']+x0, 'ymin': box['ymin']+y0,
@@ -254,7 +230,7 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.35):
     threshold_auto = calibrar_threshold_automatico(todas)
     kept = []
     for r in sorted([x for x in todas if x['score'] >= threshold_auto], key=lambda x: -x['score']):
-        if all(_iou(r, k) < 0.65 for k in kept):
+        if all(_iou(r, k) < 0.60 for k in kept): # IOU mais rigoroso (0.60)
             kept.append(r)
     from PIL import ImageDraw
     out = Image.fromarray(img_np.copy())
@@ -262,8 +238,8 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.35):
     for r in kept:
         b = r['box']
         x1,y1,x2,y2 = int(b['xmin']),int(b['ymin']),int(b['xmax']),int(b['ymax'])
-        draw.rectangle([x1,y1,x2,y2], outline=(0,200,0), width=2)
-        draw.text((x1, max(y1-12,0)), f"{r['score']:.2f}", fill=(0,200,0))
+        draw.rectangle([x1,y1,x2,y2], outline=(0, 255, 0), width=3)
+        draw.text((x1, max(y1-12,0)), f"{r['score']:.2f}", fill=(0, 255, 0))
     return len(kept), np.array(out), threshold_auto
 
 def detetar_ervas(imagem_pil, conf=0.4):
@@ -300,16 +276,14 @@ if opcao.startswith("🍎"):
         "OWLv2 Sliding Window (zero-shot)",
     ])
     
-    # Slider de IOU para controlar sobreposição
     if not pipeline_frutos.startswith("OWLv2"):
-        iou_threshold = st.sidebar.slider("Filtro de Sobreposição (IOU)", 0.1, 0.9, 0.45, 0.05, 
-                                         help="Valores mais baixos eliminam mais caixas sobrepostas, evitando a sobrecontagem.")
+        iou_threshold = st.sidebar.slider("Filtro de Sobreposição (IOU)", 0.1, 0.9, 0.45, 0.05)
     
     if pipeline_frutos.startswith("YOLOv8 MinneApple"):
-        conf_threshold = st.sidebar.slider("Confiança mínima", 0.05, 0.90, 0.35, 0.05)
+        conf_threshold = st.sidebar.slider("Confiança mínima", 0.05, 0.90, 0.45, 0.05)
         calibrar_auto = st.sidebar.checkbox("🎯 Calibrar threshold automaticamente", value=False)
     elif pipeline_frutos.startswith("YOLOv8 Frutas"):
-        conf_threshold = st.sidebar.slider("Confiança mínima", 0.05, 0.90, 0.20, 0.05)
+        conf_threshold = st.sidebar.slider("Confiança mínima", 0.05, 0.90, 0.35, 0.05)
         calibrar_auto = st.sidebar.checkbox("🎯 Calibrar threshold automaticamente", value=True)
         frutos_disponiveis = ["Todos","apple","banana","papaya","pineapple","watermelon",
                               "coconut/cocoanut","orange/orange fruit","grape","tomato",
@@ -317,7 +291,7 @@ if opcao.startswith("🍎"):
         fruto_filtro = st.sidebar.selectbox("Filtrar por fruto:", frutos_disponiveis)
     else:
         tile_size = st.sidebar.select_slider("Tamanho do tile (px)", [300,400,500,640], value=500)
-        st.sidebar.caption("⚠️ Modo avançado: 2–4 minutos. Threshold calibrado automaticamente.")
+        st.sidebar.warning("⚠️ O OWLv2 é sensível a folhagem. Usamos queries específicas e threshold mínimo de 0.45 para maior precisão.")
         calibrar_auto = True
 
 elif opcao.startswith("🌿"):
@@ -336,7 +310,6 @@ if uploaded_file is not None:
         st.subheader("Imagem original")
         st.image(imagem, use_column_width=True)
 
-    # Doenças
     if opcao.startswith("🍃"):
         with st.spinner("A classificar a doença..."):
             resultados = prever_doenca(imagem)
@@ -348,78 +321,39 @@ if uploaded_file is not None:
             st.write("Outras possibilidades:")
             for classe, conf in resultados[1:]:
                 st.write(f"- {traduzir_classe(classe)}: {conf*100:.1f}%")
-        st.caption("Modelo: EfficientNetB0 — PlantVillage (38 classes, 99% accuracy).")
 
-    # Contagem de frutos
     elif opcao.startswith("🍎"):
-
         if not pipeline_frutos.startswith("OWLv2"):
             modelo_fn = carregar_minneapple if pipeline_frutos.startswith("YOLOv8 MinneApple") else carregar_fruits_veg
             imgsz = 960 if pipeline_frutos.startswith("YOLOv8 MinneApple") else 640
-            label = "MinneApple" if pipeline_frutos.startswith("YOLOv8 MinneApple") else "Frutas & Vegetais (63 classes)"
+            label = "MinneApple" if pipeline_frutos.startswith("YOLOv8 MinneApple") else "Frutas & Vegetais"
 
-            # Calibração automática: analisar curva de threshold
             if calibrar_auto:
-                with st.spinner("A analisar distribuição de scores para calibrar threshold..."):
+                with st.spinner("A calibrar..."):
                     scores = obter_todos_scores_yolo(imagem, modelo_fn, imgsz=imgsz)
-
                 if scores:
                     thresholds = np.arange(0.05, 0.91, 0.05)
                     contagens_curva = calcular_curva_threshold(scores, thresholds)
-                    threshold_joelho = encontrar_joelho_curva(thresholds, contagens_curva)
+                    conf_threshold = encontrar_joelho_curva(thresholds, contagens_curva)
+                    st.sidebar.info(f"🎯 Threshold sugerido: **{conf_threshold}**")
 
-                    # Mostrar curva interativa
-                    with st.expander("📊 Curva de calibração de threshold", expanded=True):
-                        import matplotlib.pyplot as plt
-                        fig, ax = plt.subplots(figsize=(8, 3))
-                        ax.plot(thresholds, contagens_curva, 'b-o', markersize=4)
-                        ax.axvline(x=threshold_joelho, color='red', linestyle='--',
-                                   label=f'Threshold sugerido: {threshold_joelho}')
-                        ax.axvline(x=conf_threshold, color='green', linestyle='-',
-                                   label=f'Threshold atual: {conf_threshold}')
-                        ax.set_xlabel('Threshold de confiança')
-                        ax.set_ylabel('Nº de deteções')
-                        ax.set_title('Nº de objetos detetados por threshold')
-                        ax.legend()
-                        ax.grid(True, alpha=0.3)
-                        st.pyplot(fig)
-                        plt.close()
-
-                    st.sidebar.info(f"🎯 Threshold sugerido pela curva: **{threshold_joelho}**")
-                    conf_threshold = threshold_joelho
-
-            with st.spinner(f"A detetar com YOLOv8 {label}..."):
+            with st.spinner(f"A detetar com YOLOv8..."):
                 n, img_anotada, contagens = contar_com_threshold(
                     imagem, modelo_fn, conf_threshold, imgsz=imgsz, fruto_filtro=fruto_filtro, iou_threshold=iou_threshold)
-
             with col2:
                 st.subheader(f"Resultado — {label}")
                 st.metric("🍎 Objetos detetados", n)
                 st.image(img_anotada, use_column_width=True)
 
-            if contagens and pipeline_frutos.startswith("YOLOv8 Frutas"):
-                st.write("**Contagem por classe:**")
-                cols = st.columns(4)
-                for i, (nome, count) in enumerate(sorted(contagens.items(), key=lambda x: -x[1])):
-                    cols[i % 4].metric(nome, count)
-
-            if pipeline_frutos.startswith("YOLOv8 MinneApple"):
-                st.caption("Modelo: YOLOv8n MinneApple. Filtro NMS ativo para evitar sobrecontagem.")
-            else:
-                st.caption("Modelo: YOLOv8 LVIS Frutas & Vegetais (63 classes). Filtro NMS ativo.")
-
         else:
-            st.info("🔍 OWLv2 Sliding Window — threshold calibrado automaticamente. Aguarde...")
-            with st.spinner("A processar..."):
+            with st.spinner("A processar com OWLv2 (Sliding Window)..."):
                 n, img_anotada, threshold_auto = contar_owlv2(imagem, tile_size=tile_size)
             with col2:
                 st.subheader("Resultado — OWLv2 (zero-shot)")
                 st.metric("🍎 Maçãs detetadas", n)
                 st.image(img_anotada, use_column_width=True)
             st.sidebar.success(f"🎯 Threshold automático: **{threshold_auto}**")
-            st.caption(f"Modelo: OWLv2 zero-shot com calibração Otsu. Threshold: {threshold_auto} | Tile: {tile_size}px.")
 
-    # Ervas daninhas
     else:
         with st.spinner("A detetar plantas..."):
             n_crop, n_weed, img_anotada = detetar_ervas(imagem, conf=conf_threshold)
@@ -429,7 +363,6 @@ if uploaded_file is not None:
             c1.metric("🌾 Cultura (crop)", n_crop)
             c2.metric("🌿 Erva daninha (weed)", n_weed)
             st.image(img_anotada, use_column_width=True)
-        st.caption("Modelo: YOLOv8n — dataset sésamo + ervas daninhas (mAP50: 0.826).")
 
 else:
     st.info("Carregue uma imagem para começar.")
