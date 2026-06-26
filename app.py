@@ -16,6 +16,8 @@ EFFICIENTNET_PATH = os.path.join(MODELOS_DIR, "plantvillage_efficientnet_final.k
 CLASS_NAMES_PATH  = os.path.join(MODELOS_DIR, "class_names.json")
 FRUITS_VEG_PATH   = os.path.join(MODELOS_DIR, "yolo_fruits_and_vegetables_v3.pt")
 WEED_PATH         = os.path.join(MODELOS_DIR, "weed_yolo_best.pt")
+INCEPTION_PATH    = os.path.join(MODELOS_DIR, "inception.keras")
+RESNET_PATH       = os.path.join(MODELOS_DIR, "resnet.keras")
 
 IMG_SIZE = (224, 224)
 
@@ -82,6 +84,16 @@ def carregar_modelo_ervas():
     return YOLO(WEED_PATH)
 
 @st.cache_resource
+def carregar_inception():
+    import tensorflow as tf
+    return tf.keras.models.load_model(INCEPTION_PATH, compile=False)
+
+@st.cache_resource
+def carregar_resnet():
+    import tensorflow as tf
+    return tf.keras.models.load_model(RESNET_PATH, compile=False)
+
+@st.cache_resource
 def carregar_owlv2():
     from transformers import pipeline
     import torch
@@ -106,13 +118,11 @@ def detetar_frutas_veg(imagem_pil, conf=0.25):
     modelo = carregar_fruits_veg()
     img_np = np.array(imagem_pil)
     res = modelo.predict(source=img_np, conf=conf, imgsz=640, verbose=False)[0]
-    
     contagens = {}
     for box in res.boxes:
         cls_id = int(box.cls)
         nome = modelo.names[cls_id]
         contagens[nome] = contagens.get(nome, 0) + 1
-        
     return res.plot()[:, :, ::-1], contagens
 
 def _iou(a, b):
@@ -128,18 +138,14 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.30, min_conf=0.25):
     detector = carregar_owlv2()
     img_np = np.array(imagem_pil)
     H, W = img_np.shape[:2]
-    
     queries = ["ripe red apple", "green leaf", "tree branch"]
-    
     step = int(tile_size * (1 - overlap))
     ys = list(range(0, max(1, H - tile_size + 1), step))
     xs = list(range(0, max(1, W - tile_size + 1), step))
     if not ys or ys[-1] + tile_size < H: ys.append(max(0, H - tile_size))
     if not xs or xs[-1] + tile_size < W: xs.append(max(0, W - tile_size))
-    
     todas = []
     prog = st.progress(0, text="Análise multiescala em curso...")
-    
     for ti, y0 in enumerate(ys):
         for tj, x0 in enumerate(xs):
             tile = imagem_pil.crop((x0, y0, min(x0+tile_size,W), min(y0+tile_size,H)))
@@ -153,14 +159,11 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.30, min_conf=0.25):
                     'box': {'xmin': box['xmin']+x0, 'ymin': box['ymin']+y0,
                             'xmax': box['xmax']+x0, 'ymax': box['ymax']+y0}})
         prog.progress(min((ti+1)/len(ys), 1.0))
-    
     prog.empty()
-    
     kept = []
     for r in sorted(todas, key=lambda x: -x['score']):
         if all(_iou(r, k) < 0.30 for k in kept):
             kept.append(r)
-            
     from PIL import ImageDraw
     out = Image.fromarray(img_np.copy())
     draw = ImageDraw.Draw(out)
@@ -169,7 +172,6 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.30, min_conf=0.25):
         x1,y1,x2,y2 = int(b['xmin']),int(b['ymin']),int(b['xmax']),int(b['ymax'])
         draw.rectangle([x1,y1,x2,y2], outline=(0, 255, 0), width=3)
         draw.text((x1, max(y1-15,0)), f"{r['score']:.2f}", fill=(0, 255, 0))
-        
     return len(kept), np.array(out)
 
 def detetar_ervas(imagem_pil, conf=0.4):
@@ -178,6 +180,17 @@ def detetar_ervas(imagem_pil, conf=0.4):
     n_crop = sum(1 for c in res.boxes.cls if int(c) == 0)
     n_weed = sum(1 for c in res.boxes.cls if int(c) == 1)
     return n_crop, n_weed, res.plot()[:, :, ::-1]
+
+def prever_cnn(imagem_pil, modelo):
+    img = imagem_pil.resize(IMG_SIZE).convert("RGB")
+    arr = np.array(img).astype(np.float32) / 255.0
+    arr = np.expand_dims(arr, axis=0)
+    prob = float(modelo.predict(arr, verbose=0)[0][0])
+    # sigmoid binário: prob > 0.5 → weed, senão → crop
+    if prob > 0.5:
+        return "🌿 Erva Daninha", prob
+    else:
+        return "🌾 Cultura", 1.0 - prob
 
 # ---------- Interface ----------
 
@@ -201,6 +214,12 @@ if opcao == "🍎 Contagem de Precisão (Maçãs)":
 
 elif opcao == "🔍 Deteção Geral (Multiclasse)":
     conf_threshold = st.sidebar.slider("Confiança YOLO", 0.10, 0.90, 0.25, 0.05)
+
+elif opcao == "🌿 Deteção de Ervas Daninhas":
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Configuração")
+    conf_weed = st.sidebar.slider("Confiança YOLO", 0.10, 0.90, 0.40, 0.05)
+    usar_cnn = st.sidebar.checkbox("Confirmação por CNN (InceptionV3 + ResNet50)", value=True)
 
 uploaded_file = st.file_uploader("Carregar Imagem de Campo", type=["jpg","jpeg","png"])
 
@@ -230,18 +249,16 @@ if uploaded_file is not None:
             st.success(f"**{traduzir_classe(classe_top)}**")
             st.metric("Confiança", f"{conf_top*100:.1f}%")
 
-    # 3. Deteção Geral (Multiclasse com Tabela de Dados)
+    # 3. Deteção Geral
     elif opcao == "🔍 Deteção Geral (Multiclasse)":
         with st.spinner("A detetar objetos e organizar dados..."):
             img_anotada, contagens = detetar_frutas_veg(imagem, conf=conf_threshold)
         with col2:
             st.subheader("Resultados da Deteção")
             st.image(img_anotada, use_column_width=True)
-            
             if contagens:
-                st.write("**Dados Quantitativos:**")
-                # Criar tabela de dados
                 import pandas as pd
+                st.write("**Dados Quantitativos:**")
                 df = pd.DataFrame(list(contagens.items()), columns=['Classe', 'Quantidade'])
                 st.table(df)
             else:
@@ -250,16 +267,47 @@ if uploaded_file is not None:
     # 4. Ervas Daninhas
     else:
         with st.spinner("A mapear infestantes..."):
-            n_crop, n_weed, img_anotada = detetar_ervas(imagem)
+            n_crop, n_weed, img_anotada = detetar_ervas(imagem, conf=conf_weed)
         with col2:
-            st.subheader("Métricas de Campo")
+            st.subheader("Métricas de Campo — YOLOv8")
             c1, c2 = st.columns(2)
             c1.metric("🌾 Cultura", n_crop)
             c2.metric("🌿 Ervas Daninhas", n_weed)
             st.image(img_anotada, use_column_width=True)
 
+        # Confirmação CNN
+        if usar_cnn:
+            st.markdown("---")
+            st.subheader("Confirmação por Classificação CNN")
+            col_inc, col_res = st.columns(2)
+
+            with st.spinner("A executar InceptionV3 e ResNet50..."):
+                modelo_inc = carregar_inception()
+                modelo_res = carregar_resnet()
+                label_inc, conf_inc = prever_cnn(imagem, modelo_inc)
+                label_res, conf_res = prever_cnn(imagem, modelo_res)
+
+            with col_inc:
+                st.markdown("**InceptionV3**")
+                st.metric("Classificação", label_inc)
+                st.metric("Confiança", f"{conf_inc*100:.1f}%")
+
+            with col_res:
+                st.markdown("**ResNet50**")
+                st.metric("Classificação", label_res)
+                st.metric("Confiança", f"{conf_res*100:.1f}%")
+
+            # Consenso
+            votos_weed = sum(1 for l in [label_inc, label_res] if "Erva" in l)
+            if votos_weed >= 2:
+                st.error("⚠️ Consenso CNN: **Presença dominante de ervas daninhas** confirmada.")
+            elif votos_weed == 1:
+                st.warning("⚠️ Consenso CNN: **Resultado misto** — verificar manualmente.")
+            else:
+                st.success("✅ Consenso CNN: **Cultura predominante** confirmada.")
+
 else:
-    st.info("Carregue uma imagem capturada no pomar para iniciar a análise.")
+    st.info("Carregue uma imagem capturada no campo para iniciar a análise.")
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Projeto Académico — Agricultura 4.0")
