@@ -3,7 +3,6 @@ import numpy as np
 from PIL import Image
 import json
 import os
-import cv2
 
 st.set_page_config(
     page_title="Agricultura Inteligente",
@@ -108,7 +107,8 @@ def prever_doenca(imagem_pil):
     modelo, classes = carregar_modelo_doencas()
     img = imagem_pil.resize(IMG_SIZE)
     arr = np.array(img)
-    if arr.shape[-1] == 4: arr = arr[..., :3]
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
     arr = np.expand_dims(arr, axis=0)
     preds = modelo.predict(arr, verbose=0)[0]
     idx_top = np.argsort(preds)[::-1][:3]
@@ -138,7 +138,7 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.30, min_conf=0.25):
     detector = carregar_owlv2()
     img_np = np.array(imagem_pil)
     H, W = img_np.shape[:2]
-    queries = ["ripe red apple", "green leaf", "tree branch"]
+    queries = ["ripe red apple"]
     step = int(tile_size * (1 - overlap))
     ys = list(range(0, max(1, H - tile_size + 1), step))
     xs = list(range(0, max(1, W - tile_size + 1), step))
@@ -150,7 +150,7 @@ def contar_owlv2(imagem_pil, tile_size=500, overlap=0.30, min_conf=0.25):
         for tj, x0 in enumerate(xs):
             tile = imagem_pil.crop((x0, y0, min(x0+tile_size,W), min(y0+tile_size,H)))
             for r in detector(tile, candidate_labels=queries):
-                if r['label'] != "ripe red apple" or r['score'] < min_conf:
+                if r['score'] < min_conf:
                     continue
                 box = r['box']
                 if (box['xmax'] - box['xmin']) < 15 or (box['ymax'] - box['ymin']) < 15:
@@ -186,7 +186,6 @@ def prever_cnn(imagem_pil, modelo):
     arr = np.array(img).astype(np.float32) / 255.0
     arr = np.expand_dims(arr, axis=0)
     prob = float(modelo.predict(arr, verbose=0)[0][0])
-    # sigmoid binário: prob > 0.5 → weed, senão → crop
     if prob > 0.5:
         return "🌿 Erva Daninha", prob
     else:
@@ -209,8 +208,8 @@ if opcao == "🍎 Contagem de Precisão (Maçãs)":
     st.sidebar.markdown("---")
     st.sidebar.subheader("Ajuste de Sensibilidade")
     min_conf = st.sidebar.slider("Limiar de Confiança", 0.10, 0.80, 0.35, 0.05)
-    tile_size = st.sidebar.select_slider("Janela de Análise (px)", [50, 100, 200, 300, 400, 500, 640], value=500)
-    st.sidebar.success("✅ Algoritmo de contraste ativo.")
+    tile_size = st.sidebar.select_slider("Janela de Análise (px)", [200, 300, 400, 500, 640], value=500)
+    st.sidebar.caption("⚠️ Pode demorar 2–4 minutos.")
 
 elif opcao == "🔍 Deteção Geral (Multiclasse)":
     conf_threshold = st.sidebar.slider("Confiança YOLO", 0.10, 0.90, 0.25, 0.05)
@@ -230,7 +229,6 @@ if uploaded_file is not None:
         st.subheader("Entrada")
         st.image(imagem, use_column_width=True)
 
-    # 1. Contagem de Maçãs (OWLv2)
     if opcao == "🍎 Contagem de Precisão (Maçãs)":
         with st.spinner("A processar filtragem de folhagem e contagem..."):
             n, img_anotada = contar_owlv2(imagem, tile_size=tile_size, min_conf=min_conf)
@@ -238,8 +236,8 @@ if uploaded_file is not None:
             st.subheader("Resultado da Contagem")
             st.metric("🍎 Maçãs Confirmadas", n)
             st.image(img_anotada, use_column_width=True)
+        st.caption("⚠️ OWLv2 zero-shot. Ajuste o limiar de confiança se a contagem parecer desviada.")
 
-    # 2. Doenças
     elif opcao == "🍃 Diagnóstico de Doenças":
         with st.spinner("A analisar tecidos vegetais..."):
             resultados = prever_doenca(imagem)
@@ -248,8 +246,11 @@ if uploaded_file is not None:
             classe_top, conf_top = resultados[0]
             st.success(f"**{traduzir_classe(classe_top)}**")
             st.metric("Confiança", f"{conf_top*100:.1f}%")
+            st.write("Outras possibilidades:")
+            for classe, conf in resultados[1:]:
+                st.write(f"- {traduzir_classe(classe)}: {conf*100:.1f}%")
+        st.caption("⚠️ EfficientNetB0 treinado no PlantVillage (38 classes, 99% accuracy).")
 
-    # 3. Deteção Geral
     elif opcao == "🔍 Deteção Geral (Multiclasse)":
         with st.spinner("A detetar objetos e organizar dados..."):
             img_anotada, contagens = detetar_frutas_veg(imagem, conf=conf_threshold)
@@ -263,8 +264,8 @@ if uploaded_file is not None:
                 st.table(df)
             else:
                 st.warning("Nenhum objeto detetado com o threshold atual.")
+        st.caption("⚠️ YOLOv8 treinado no LVIS (63 classes de frutas e vegetais).")
 
-    # 4. Ervas Daninhas
     else:
         with st.spinner("A mapear infestantes..."):
             n_crop, n_weed, img_anotada = detetar_ervas(imagem, conf=conf_weed)
@@ -274,30 +275,25 @@ if uploaded_file is not None:
             c1.metric("🌾 Cultura", n_crop)
             c2.metric("🌿 Ervas Daninhas", n_weed)
             st.image(img_anotada, use_column_width=True)
+        st.caption("⚠️ YOLOv8n treinado em dataset de sésamo + ervas daninhas (mAP50: 0.826).")
 
-        # Confirmação CNN
         if usar_cnn:
             st.markdown("---")
             st.subheader("Confirmação por Classificação CNN")
             col_inc, col_res = st.columns(2)
-
             with st.spinner("A executar InceptionV3 e ResNet50..."):
                 modelo_inc = carregar_inception()
                 modelo_res = carregar_resnet()
                 label_inc, conf_inc = prever_cnn(imagem, modelo_inc)
                 label_res, conf_res = prever_cnn(imagem, modelo_res)
-
             with col_inc:
                 st.markdown("**InceptionV3**")
                 st.metric("Classificação", label_inc)
                 st.metric("Confiança", f"{conf_inc*100:.1f}%")
-
             with col_res:
                 st.markdown("**ResNet50**")
                 st.metric("Classificação", label_res)
                 st.metric("Confiança", f"{conf_res*100:.1f}%")
-
-            # Consenso
             votos_weed = sum(1 for l in [label_inc, label_res] if "Erva" in l)
             if votos_weed >= 2:
                 st.error("⚠️ Consenso CNN: **Presença dominante de ervas daninhas** confirmada.")
