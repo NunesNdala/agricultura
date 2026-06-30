@@ -6,6 +6,6 @@ torchvision==0.17.2
 tensorflow-cpu>=2.15.0
 Pillow>=10.0.0
 numpy<2.0.0
-transformers>=4.38.0
+transformers==4.40.0
 matplotlib>=3.7.0
 pandas
