@@ -227,7 +227,7 @@ if uploaded_file is not None:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Entrada")
-        st.image(imagem, use_column_width=True)
+        st.image(imagem, width="stretch")
 
     if opcao == "🍎 Contagem de Precisão (Maçãs)":
         with st.spinner("A processar filtragem de folhagem e contagem..."):
@@ -235,7 +235,7 @@ if uploaded_file is not None:
         with col2:
             st.subheader("Resultado da Contagem")
             st.metric("🍎 Maçãs Confirmadas", n)
-            st.image(img_anotada, use_column_width=True)
+            st.image(img_anotada, width="stretch")
         st.caption("⚠️ OWLv2 zero-shot. Ajuste o limiar de confiança se a contagem parecer desviada.")
 
     elif opcao == "🍃 Diagnóstico de Doenças":
@@ -256,7 +256,7 @@ if uploaded_file is not None:
             img_anotada, contagens = detetar_frutas_veg(imagem, conf=conf_threshold)
         with col2:
             st.subheader("Resultados da Deteção")
-            st.image(img_anotada, use_column_width=True)
+            st.image(img_anotada, width="stretch")
             if contagens:
                 import pandas as pd
                 st.write("**Dados Quantitativos:**")
@@ -274,7 +274,7 @@ if uploaded_file is not None:
             c1, c2 = st.columns(2)
             c1.metric("🌾 Cultura", n_crop)
             c2.metric("🌿 Ervas Daninhas", n_weed)
-            st.image(img_anotada, use_column_width=True)
+            st.image(img_anotada, width="stretch")
         st.caption("⚠️ YOLOv8n treinado em dataset de sésamo + ervas daninhas (mAP50: 0.826).")
 
         if usar_cnn:
