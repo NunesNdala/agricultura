@@ -4,6 +4,8 @@ import pandas as pd
 from PIL import Image
 import json
 import os
+import glob
+import matplotlib.pyplot as plt
 
 st.set_page_config(
     page_title="Agricultura Inteligente",
@@ -18,6 +20,18 @@ FRUITS_VEG_PATH   = os.path.join(MODELOS_DIR, "yolo_fruits_and_vegetables_v3.pt"
 WEED_PATH         = os.path.join(MODELOS_DIR, "weed_yolo_best.pt")
 INCEPTION_PATH    = os.path.join(MODELOS_DIR, "inception.keras")
 RESNET_PATH       = os.path.join(MODELOS_DIR, "resnet.keras")
+# Modelo treinado no MinneApple (contagem de maçãs) referido no relatório.
+# NOTA: a aba de contagem ao vivo usa OWLv2 zero-shot, não este modelo.
+# Este ficheiro é usado apenas para gerar as métricas reais desta secção.
+MINNEAPPLE_PATH   = os.path.join(MODELOS_DIR, "yolo_minneapple_v2.pt")
+
+# Dados de validação usados para calcular métricas REAIS (não inventadas).
+# Estrutura esperada — ver aviso na aba "Métricas de Avaliação" se estiver em falta.
+VALIDACAO_DIR          = "dados_validacao"
+PLANTVILLAGE_VAL_DIR   = os.path.join(VALIDACAO_DIR, "plantvillage")        # pastas por classe
+AGRI_CNN_VAL_DIR       = os.path.join(VALIDACAO_DIR, "agri_data_cnn")      # pastas "crop"/"weed"
+AGRI_YOLO_DATA_YAML    = os.path.join(VALIDACAO_DIR, "agri_data_yolo", "data.yaml")
+MINNEAPPLE_DATA_YAML   = os.path.join(VALIDACAO_DIR, "minneapple_yolo", "data.yaml")
 
 IMG_SIZE = (224, 224)
 
@@ -192,109 +206,261 @@ def prever_cnn(imagem_pil, modelo):
     else:
         return "🌾 Cultura", 1.0 - prob
 
+def _plot_matriz_confusao(y_true, y_pred, labels, titulo, normalizar=True, figsize=(6, 5)):
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(y_true, y_pred, labels=range(len(labels)))
+    if normalizar:
+        with np.errstate(all="ignore"):
+            cm_show = cm.astype("float") / cm.sum(axis=1, keepdims=True)
+        cm_show = np.nan_to_num(cm_show)
+        fmt = ".2f"
+    else:
+        cm_show = cm
+        fmt = "d"
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(cm_show, cmap="Blues")
+    ax.set_title(titulo)
+    ax.set_xlabel("Previsto")
+    ax.set_ylabel("Real")
+    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=90, fontsize=6)
+    ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels, fontsize=6)
+    if len(labels) <= 6:
+        for i in range(len(labels)):
+            for j in range(len(labels)):
+                ax.text(j, i, format(cm_show[i, j], fmt), ha="center", va="center",
+                         color="white" if cm_show[i, j] > cm_show.max()/2 else "black", fontsize=8)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    return fig, cm
+
+
+def _plot_roc_binaria(y_true, y_score, titulo):
+    from sklearn.metrics import roc_curve, auc
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    roc_auc = auc(fpr, tpr)
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    ax.set_xlabel("Taxa de Falsos Positivos")
+    ax.set_ylabel("Taxa de Verdadeiros Positivos")
+    ax.set_title(titulo)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    return fig, roc_auc
+
+
+def _plot_roc_multiclasse(y_true, y_prob, n_classes, titulo):
+    """Curva ROC macro-average (one-vs-rest), útil para muitas classes (ex.: 38 doenças)."""
+    from sklearn.preprocessing import label_binarize
+    from sklearn.metrics import roc_curve, auc
+    y_bin = label_binarize(y_true, classes=range(n_classes))
+    fpr_list, tpr_list = [], []
+    all_fpr = np.linspace(0, 1, 200)
+    for c in range(n_classes):
+        if y_bin[:, c].sum() == 0:
+            continue
+        fpr, tpr, _ = roc_curve(y_bin[:, c], y_prob[:, c])
+        fpr_list.append(fpr); tpr_list.append(tpr)
+    mean_tpr = np.zeros_like(all_fpr)
+    for fpr, tpr in zip(fpr_list, tpr_list):
+        mean_tpr += np.interp(all_fpr, fpr, tpr)
+    mean_tpr /= max(len(fpr_list), 1)
+    macro_auc = auc(all_fpr, mean_tpr)
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot(all_fpr, mean_tpr, label=f"Macro-average AUC = {macro_auc:.3f}")
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    ax.set_xlabel("Taxa de Falsos Positivos")
+    ax.set_ylabel("Taxa de Verdadeiros Positivos")
+    ax.set_title(titulo)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    return fig, macro_auc
+
+
+@st.cache_data(show_spinner=False)
+def _avaliar_efficientnet_cache():
+    """Corre o EfficientNetB0 sobre o conjunto de validação real e devolve y_true/y_pred/y_prob."""
+    import tensorflow as tf
+    modelo = tf.keras.models.load_model(EFFICIENTNET_PATH)
+    with open(CLASS_NAMES_PATH, encoding="utf-8") as f:
+        classes = json.load(f)
+
+    ds = tf.keras.utils.image_dataset_from_directory(
+        PLANTVILLAGE_VAL_DIR, image_size=IMG_SIZE, batch_size=32,
+        shuffle=False, label_mode="int"
+    )
+    pastas = ds.class_names  # ordem alfabética das subpastas do disco
+    # mapear índice da pasta -> índice usado pelo modelo (class_names.json)
+    mapa = [classes.index(nome) for nome in pastas]
+
+    y_true, y_prob = [], []
+    for x, y in ds:
+        y_prob.append(modelo.predict(x, verbose=0))
+        y_true.append(y.numpy())
+    y_true = np.concatenate(y_true)
+    y_true = np.array([mapa[i] for i in y_true])
+    y_prob = np.concatenate(y_prob)
+    y_pred = np.argmax(y_prob, axis=1)
+    return y_true, y_pred, y_prob, classes
+
+
+@st.cache_data(show_spinner=False)
+def _avaliar_cnn_binaria_cache(caminho_modelo):
+    """Avalia InceptionV3 ou ResNet50 (crop=0 / weed=1) no conjunto de validação real."""
+    import tensorflow as tf
+    modelo = tf.keras.models.load_model(caminho_modelo, compile=False)
+    ds = tf.keras.utils.image_dataset_from_directory(
+        AGRI_CNN_VAL_DIR, image_size=IMG_SIZE, batch_size=32,
+        shuffle=False, label_mode="binary"
+    )
+    y_true, y_prob = [], []
+    for x, y in ds:
+        x = tf.cast(x, tf.float32) / 255.0
+        y_prob.append(modelo.predict(x, verbose=0).ravel())
+        y_true.append(y.numpy().ravel())
+    y_true = np.concatenate(y_true)
+    y_prob = np.concatenate(y_prob)
+    y_pred = (y_prob > 0.5).astype(int)
+    return y_true, y_pred, y_prob
+
+
+@st.cache_data(show_spinner=False)
+def _avaliar_yolo_cache(caminho_modelo, data_yaml):
+    """Corre model.val() do Ultralytics: gera matriz de confusão, PR/F1/P/R curves automaticamente."""
+    from ultralytics import YOLO
+    modelo = YOLO(caminho_modelo)
+    resultados = modelo.val(data=data_yaml, split="val", plots=True, verbose=False)
+    return {
+        "save_dir": str(resultados.save_dir),
+        "map50": float(resultados.box.map50),
+        "map50_95": float(resultados.box.map),
+        "precision": float(resultados.box.mp),
+        "recall": float(resultados.box.mr),
+    }
+
+
+def _mostrar_imagens_yolo(save_dir):
+    nomes = ["confusion_matrix.png", "confusion_matrix_normalized.png",
+             "PR_curve.png", "F1_curve.png", "P_curve.png", "R_curve.png"]
+    cols = st.columns(2)
+    i = 0
+    for nome in nomes:
+        caminho = os.path.join(save_dir, nome)
+        if os.path.exists(caminho):
+            with cols[i % 2]:
+                st.image(caminho, caption=nome, width="stretch")
+            i += 1
+    if i == 0:
+        st.warning("O Ultralytics não gerou imagens de avaliação — verifica a versão do pacote.")
+
+
 def mostrar_metricas_avaliacao():
     st.subheader("Métricas de Avaliação dos Modelos")
-    st.caption("Valores obtidos durante o treino e validação, conforme apresentados no relatório.")
+    st.caption(
+        "Estas métricas são calculadas em tempo real a partir dos modelos e do conjunto de "
+        "validação em `dados_validacao/` — não são valores fixos no código."
+    )
 
-    aba_doencas, aba_ervas, aba_macas, aba_datasets = st.tabs([
-        "Diagnóstico de Doenças", "Deteção de Ervas Daninhas", "Contagem de Maçãs", "Datasets"
+    if not os.path.isdir(VALIDACAO_DIR):
+        st.error(
+            "Pasta `dados_validacao/` não encontrada. Estrutura esperada:\n\n"
+            "```\n"
+            "dados_validacao/\n"
+            "├── plantvillage/            # subpasta por classe (mesmos nomes de class_names.json)\n"
+            "├── agri_data_cnn/           # subpastas 'crop' e 'weed'\n"
+            "├── agri_data_yolo/data.yaml # apontando para imagens/labels YOLO de validação\n"
+            "└── minneapple_yolo/data.yaml\n"
+            "```\n"
+            "Sem estes dados não é possível calcular matrizes de confusão nem curvas ROC/PR reais."
+        )
+        return
+
+    aba_doencas, aba_ervas, aba_macas = st.tabs([
+        "Diagnóstico de Doenças", "Deteção de Ervas Daninhas", "Contagem de Maçãs"
     ])
 
+    # ---------------- Doenças (EfficientNetB0, 38 classes) ----------------
     with aba_doencas:
-        st.markdown("**EfficientNetB0 — evolução do treino (38 classes, PlantVillage)**")
-        df_treino = pd.DataFrame({
-            "Época": [1, 10, 11, 15, 20],
-            "Fase": ["Fase 1", "Fase 1", "Fine-tuning", "Fine-tuning", "Fine-tuning"],
-            "Acc. Treino": [0.9095, 0.9540, 0.7612, 0.9811, 0.9839],
-            "Acc. Validação": [0.9365, 0.9677, 0.9214, 0.9876, 0.9886],
-        })
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.dataframe(
-                df_treino.style.format({"Acc. Treino": "{:.2%}", "Acc. Validação": "{:.2%}"}),
-                width="stretch", hide_index=True
-            )
-        with c2:
-            st.line_chart(df_treino.set_index("Época")[["Acc. Treino", "Acc. Validação"]])
-        st.metric("Acurácia de validação final", "98,9%")
+        if not os.path.isdir(PLANTVILLAGE_VAL_DIR):
+            st.warning(f"Não encontrei `{PLANTVILLAGE_VAL_DIR}`. Coloca aí o conjunto de validação do PlantVillage (pastas por classe).")
+        elif st.button("Calcular métricas — EfficientNetB0", key="btn_doencas"):
+            with st.spinner("A correr o modelo sobre o conjunto de validação (pode demorar vários minutos)..."):
+                y_true, y_pred, y_prob, classes = _avaliar_efficientnet_cache()
+            acc = float((y_true == y_pred).mean())
+            st.metric("Acurácia real no conjunto de validação", f"{acc:.2%}")
 
-        st.markdown("---")
-        st.markdown("**Resultados em imagens reais de campo**")
-        df_campo = pd.DataFrame({
-            "Imagem de teste": ["Folha de tomateiro com necrose", "Caule com manchas escuras", "Folha com gotas de água"],
-            "Diagnóstico": ["Tomateiro — Requeima", "Tomateiro — Pinta-preta", "Milho — Mancha-cinzenta"],
-            "Confiança": [0.999, 0.855, 0.482],
-        })
-        st.dataframe(df_campo.style.format({"Confiança": "{:.1%}"}), width="stretch", hide_index=True)
-        st.caption("⚠️ Confiança mais baixa em imagens com artefactos visuais (reflexos, gotas) fora do estilo do dataset PlantVillage.")
+            fig_cm, cm = _plot_matriz_confusao(y_true, y_pred, classes, "Matriz de Confusão (normalizada) — EfficientNetB0", figsize=(9, 8))
+            st.pyplot(fig_cm)
 
+            fig_roc, macro_auc = _plot_roc_multiclasse(y_true, y_prob, len(classes), "Curva ROC macro-average (one-vs-rest)")
+            st.pyplot(fig_roc)
+
+            from sklearn.metrics import classification_report
+            relatorio = classification_report(y_true, y_pred, target_names=classes, output_dict=True, zero_division=0)
+            st.dataframe(pd.DataFrame(relatorio).transpose(), width="stretch")
+        else:
+            st.info("Clica no botão para correr a avaliação (não é feita automaticamente por ser pesada).")
+
+    # ---------------- Ervas daninhas: YOLOv8 + InceptionV3 + ResNet50 ----------------
     with aba_ervas:
-        st.markdown("**YOLOv8n — deteção (best.pt, conf=0,4)**")
-        df_yolo = pd.DataFrame({
-            "Classe": ["Todas (all)", "Crop", "Weed"],
-            "Precisão": [0.825, 0.808, 0.842],
-            "Recall": [0.747, 0.756, 0.738],
-            "mAP50": [0.826, 0.834, 0.819],
-            "mAP50-95": [0.526, 0.553, 0.498],
-        })
-        st.dataframe(
-            df_yolo.style.format({c: "{:.1%}" for c in ["Precisão", "Recall", "mAP50", "mAP50-95"]}),
-            width="stretch", hide_index=True
-        )
-
-        st.markdown("**InceptionV3 e ResNet50 — classificação CNN (agri_data)**")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("InceptionV3 (val.)", "~95,8%")
-        col2.metric("ResNet50 (val.)", "~95,8%")
-        col3.metric("Imagens treino / val.", "1.040 / 260")
+        st.markdown("**YOLOv8n — deteção (matriz de confusão + curvas PR/F1 nativas do Ultralytics)**")
+        if not os.path.exists(AGRI_YOLO_DATA_YAML):
+            st.warning(f"Não encontrei `{AGRI_YOLO_DATA_YAML}`.")
+        elif st.button("Calcular métricas — YOLOv8n (ervas daninhas)", key="btn_yolo_ervas"):
+            with st.spinner("A correr model.val()..."):
+                res = _avaliar_yolo_cache(WEED_PATH, AGRI_YOLO_DATA_YAML)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("mAP50", f"{res['map50']:.1%}")
+            c2.metric("mAP50-95", f"{res['map50_95']:.1%}")
+            c3.metric("Precisão", f"{res['precision']:.1%}")
+            c4.metric("Recall", f"{res['recall']:.1%}")
+            _mostrar_imagens_yolo(res["save_dir"])
 
         st.markdown("---")
-        st.markdown("**Teste em campo real (milho angolano com ervas daninhas)**")
-        df_ensemble = pd.DataFrame({
-            "Modelo": ["YOLOv8", "InceptionV3", "ResNet50"],
-            "Resultado": ["1 erva daninha detetada", "Erva Daninha", "Erva Daninha"],
-            "Confiança": [0.78, 0.998, 0.642],
-        })
-        st.dataframe(df_ensemble.style.format({"Confiança": "{:.1%}"}), width="stretch", hide_index=True)
-        st.success("Consenso: presença dominante de ervas daninhas confirmada (2/2 CNNs)")
+        st.markdown("**InceptionV3 e ResNet50 — classificação binária (crop / weed)**")
+        if not os.path.isdir(AGRI_CNN_VAL_DIR):
+            st.warning(f"Não encontrei `{AGRI_CNN_VAL_DIR}`.")
+        elif st.button("Calcular métricas — InceptionV3 e ResNet50", key="btn_cnn_ervas"):
+            with st.spinner("A avaliar InceptionV3..."):
+                yt_i, yp_i, ys_i = _avaliar_cnn_binaria_cache(INCEPTION_PATH)
+            with st.spinner("A avaliar ResNet50..."):
+                yt_r, yp_r, ys_r = _avaliar_cnn_binaria_cache(RESNET_PATH)
 
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**InceptionV3**")
+                st.metric("Acurácia", f"{(yt_i == yp_i).mean():.2%}")
+                fig_cm, _ = _plot_matriz_confusao(yt_i, yp_i, ["crop", "weed"], "Matriz de Confusão — InceptionV3", figsize=(4, 4))
+                st.pyplot(fig_cm)
+                fig_roc, auc_i = _plot_roc_binaria(yt_i, ys_i, "Curva ROC — InceptionV3")
+                st.pyplot(fig_roc)
+            with col2:
+                st.markdown("**ResNet50**")
+                st.metric("Acurácia", f"{(yt_r == yp_r).mean():.2%}")
+                fig_cm, _ = _plot_matriz_confusao(yt_r, yp_r, ["crop", "weed"], "Matriz de Confusão — ResNet50", figsize=(4, 4))
+                st.pyplot(fig_cm)
+                fig_roc, auc_r = _plot_roc_binaria(yt_r, ys_r, "Curva ROC — ResNet50")
+                st.pyplot(fig_roc)
+
+    # ---------------- Contagem de maçãs (YOLOv8n treinado no MinneApple) ----------------
     with aba_macas:
-        st.markdown("**YOLOv8n — comparação de versões (MinneApple)**")
-        df_macas = pd.DataFrame({
-            "Modelo": ["YOLOv8n v1 (640px)", "YOLOv8n v2 (960px)", "YOLOv8n v3 (aug.)"],
-            "mAP50": [0.811, 0.865, 0.825],
-            "mAP50-95": [0.443, 0.515, 0.438],
-            "Precisão": [0.830, 0.846, 0.814],
-            "Recall": [0.705, 0.775, 0.706],
-        })
-        st.dataframe(
-            df_macas.style.format({c: "{:.1%}" for c in ["mAP50", "mAP50-95", "Precisão", "Recall"]}),
-            width="stretch", hide_index=True
+        st.caption(
+            "⚠️ A aba de contagem ao vivo desta app usa OWLv2 (zero-shot), não este modelo. "
+            "Estas métricas avaliam o YOLOv8n treinado no MinneApple, referido no relatório."
         )
-        st.bar_chart(df_macas.set_index("Modelo")[["mAP50", "mAP50-95"]])
-        c1, c2 = st.columns(2)
-        c1.metric("Modelo em produção", "v2 (imgsz=960)")
-        c2.metric("Erro de contagem (conf=0,35)", "0,39%", help="2.303 maçãs previstas vs 2.312 reais no conjunto de validação")
-
-    with aba_datasets:
-        st.markdown("**PlantVillage**")
-        df_pv = pd.DataFrame({
-            "Partição": ["Treino", "Validação", "Teste", "Total"],
-            "Imagens": [43429, 5417, 5459, 54305],
-            "Classes": [38, 38, 38, 38],
-        })
-        st.dataframe(df_pv, width="stretch", hide_index=True)
-
-        st.markdown("**agri_data**")
-        df_agri = pd.DataFrame({
-            "Classe": ["Crop (0)", "Weed (1)", "Total"],
-            "Instâncias": [1212, 860, 2072],
-            "Proporção": [0.585, 0.415, 1.0],
-        })
-        st.dataframe(df_agri.style.format({"Proporção": "{:.1%}"}), width="stretch", hide_index=True)
-
-        st.markdown("**MinneApple**")
-        st.write("331 imagens (720×1280 px), 12.285 anotações de maçãs. Divisão 80/20: 264 imagens de treino, 67 de validação.")
+        if not os.path.exists(MINNEAPPLE_PATH):
+            st.warning(f"Não encontrei `{MINNEAPPLE_PATH}`. Coloca aí os pesos do YOLOv8n treinado no MinneApple.")
+        elif not os.path.exists(MINNEAPPLE_DATA_YAML):
+            st.warning(f"Não encontrei `{MINNEAPPLE_DATA_YAML}`.")
+        elif st.button("Calcular métricas — YOLOv8n (MinneApple)", key="btn_yolo_macas"):
+            with st.spinner("A correr model.val()..."):
+                res = _avaliar_yolo_cache(MINNEAPPLE_PATH, MINNEAPPLE_DATA_YAML)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("mAP50", f"{res['map50']:.1%}")
+            c2.metric("mAP50-95", f"{res['map50_95']:.1%}")
+            c3.metric("Precisão", f"{res['precision']:.1%}")
+            c4.metric("Recall", f"{res['recall']:.1%}")
+            _mostrar_imagens_yolo(res["save_dir"])
 
 
 # ---------- Interface ----------
