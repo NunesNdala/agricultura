@@ -1,5 +1,6 @@
 import streamlit as st
 import numpy as np
+import pandas as pd
 from PIL import Image
 import json
 import os
@@ -191,6 +192,111 @@ def prever_cnn(imagem_pil, modelo):
     else:
         return "🌾 Cultura", 1.0 - prob
 
+def mostrar_metricas_avaliacao():
+    st.subheader("Métricas de Avaliação dos Modelos")
+    st.caption("Valores obtidos durante o treino e validação, conforme apresentados no relatório.")
+
+    aba_doencas, aba_ervas, aba_macas, aba_datasets = st.tabs([
+        "Diagnóstico de Doenças", "Deteção de Ervas Daninhas", "Contagem de Maçãs", "Datasets"
+    ])
+
+    with aba_doencas:
+        st.markdown("**EfficientNetB0 — evolução do treino (38 classes, PlantVillage)**")
+        df_treino = pd.DataFrame({
+            "Época": [1, 10, 11, 15, 20],
+            "Fase": ["Fase 1", "Fase 1", "Fine-tuning", "Fine-tuning", "Fine-tuning"],
+            "Acc. Treino": [0.9095, 0.9540, 0.7612, 0.9811, 0.9839],
+            "Acc. Validação": [0.9365, 0.9677, 0.9214, 0.9876, 0.9886],
+        })
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.dataframe(
+                df_treino.style.format({"Acc. Treino": "{:.2%}", "Acc. Validação": "{:.2%}"}),
+                width="stretch", hide_index=True
+            )
+        with c2:
+            st.line_chart(df_treino.set_index("Época")[["Acc. Treino", "Acc. Validação"]])
+        st.metric("Acurácia de validação final", "98,9%")
+
+        st.markdown("---")
+        st.markdown("**Resultados em imagens reais de campo**")
+        df_campo = pd.DataFrame({
+            "Imagem de teste": ["Folha de tomateiro com necrose", "Caule com manchas escuras", "Folha com gotas de água"],
+            "Diagnóstico": ["Tomateiro — Requeima", "Tomateiro — Pinta-preta", "Milho — Mancha-cinzenta"],
+            "Confiança": [0.999, 0.855, 0.482],
+        })
+        st.dataframe(df_campo.style.format({"Confiança": "{:.1%}"}), width="stretch", hide_index=True)
+        st.caption("⚠️ Confiança mais baixa em imagens com artefactos visuais (reflexos, gotas) fora do estilo do dataset PlantVillage.")
+
+    with aba_ervas:
+        st.markdown("**YOLOv8n — deteção (best.pt, conf=0,4)**")
+        df_yolo = pd.DataFrame({
+            "Classe": ["Todas (all)", "Crop", "Weed"],
+            "Precisão": [0.825, 0.808, 0.842],
+            "Recall": [0.747, 0.756, 0.738],
+            "mAP50": [0.826, 0.834, 0.819],
+            "mAP50-95": [0.526, 0.553, 0.498],
+        })
+        st.dataframe(
+            df_yolo.style.format({c: "{:.1%}" for c in ["Precisão", "Recall", "mAP50", "mAP50-95"]}),
+            width="stretch", hide_index=True
+        )
+
+        st.markdown("**InceptionV3 e ResNet50 — classificação CNN (agri_data)**")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("InceptionV3 (val.)", "~95,8%")
+        col2.metric("ResNet50 (val.)", "~95,8%")
+        col3.metric("Imagens treino / val.", "1.040 / 260")
+
+        st.markdown("---")
+        st.markdown("**Teste em campo real (milho angolano com ervas daninhas)**")
+        df_ensemble = pd.DataFrame({
+            "Modelo": ["YOLOv8", "InceptionV3", "ResNet50"],
+            "Resultado": ["1 erva daninha detetada", "Erva Daninha", "Erva Daninha"],
+            "Confiança": [0.78, 0.998, 0.642],
+        })
+        st.dataframe(df_ensemble.style.format({"Confiança": "{:.1%}"}), width="stretch", hide_index=True)
+        st.success("Consenso: presença dominante de ervas daninhas confirmada (2/2 CNNs)")
+
+    with aba_macas:
+        st.markdown("**YOLOv8n — comparação de versões (MinneApple)**")
+        df_macas = pd.DataFrame({
+            "Modelo": ["YOLOv8n v1 (640px)", "YOLOv8n v2 (960px)", "YOLOv8n v3 (aug.)"],
+            "mAP50": [0.811, 0.865, 0.825],
+            "mAP50-95": [0.443, 0.515, 0.438],
+            "Precisão": [0.830, 0.846, 0.814],
+            "Recall": [0.705, 0.775, 0.706],
+        })
+        st.dataframe(
+            df_macas.style.format({c: "{:.1%}" for c in ["mAP50", "mAP50-95", "Precisão", "Recall"]}),
+            width="stretch", hide_index=True
+        )
+        st.bar_chart(df_macas.set_index("Modelo")[["mAP50", "mAP50-95"]])
+        c1, c2 = st.columns(2)
+        c1.metric("Modelo em produção", "v2 (imgsz=960)")
+        c2.metric("Erro de contagem (conf=0,35)", "0,39%", help="2.303 maçãs previstas vs 2.312 reais no conjunto de validação")
+
+    with aba_datasets:
+        st.markdown("**PlantVillage**")
+        df_pv = pd.DataFrame({
+            "Partição": ["Treino", "Validação", "Teste", "Total"],
+            "Imagens": [43429, 5417, 5459, 54305],
+            "Classes": [38, 38, 38, 38],
+        })
+        st.dataframe(df_pv, width="stretch", hide_index=True)
+
+        st.markdown("**agri_data**")
+        df_agri = pd.DataFrame({
+            "Classe": ["Crop (0)", "Weed (1)", "Total"],
+            "Instâncias": [1212, 860, 2072],
+            "Proporção": [0.585, 0.415, 1.0],
+        })
+        st.dataframe(df_agri.style.format({"Proporção": "{:.1%}"}), width="stretch", hide_index=True)
+
+        st.markdown("**MinneApple**")
+        st.write("331 imagens (720×1280 px), 12.285 anotações de maçãs. Divisão 80/20: 264 imagens de treino, 67 de validação.")
+
+
 # ---------- Interface ----------
 
 st.title("🌱 Visão Computacional Aplicada à Agricultura Inteligente")
@@ -201,7 +307,8 @@ opcao = st.sidebar.radio("Selecione a tarefa:", [
     "🍎 Contagem de Precisão (Maçãs)",
     "🍃 Diagnóstico de Doenças",
     "🌿 Deteção de Ervas Daninhas",
-    "🔍 Deteção Geral (Multiclasse)"
+    "🔍 Deteção Geral (Multiclasse)",
+    "📊 Métricas de Avaliação"
 ])
 
 if opcao == "🍎 Contagem de Precisão (Maçãs)":
@@ -219,6 +326,10 @@ elif opcao == "🌿 Deteção de Ervas Daninhas":
     st.sidebar.subheader("Configuração")
     conf_weed = st.sidebar.slider("Confiança YOLO", 0.10, 0.90, 0.40, 0.05)
     usar_cnn = st.sidebar.checkbox("Confirmação por CNN (InceptionV3 + ResNet50)", value=True)
+
+if opcao == "📊 Métricas de Avaliação":
+    mostrar_metricas_avaliacao()
+    st.stop()
 
 uploaded_file = st.file_uploader("Carregar Imagem de Campo", type=["jpg","jpeg","png"])
 
